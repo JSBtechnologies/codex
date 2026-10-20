@@ -40,6 +40,10 @@ use seccompiler::apply_filter;
 /// - enabling `PR_SET_NO_NEW_PRIVS` when restrictions apply, and
 /// - installing seccomp restrictions for network isolation and VM sockets.
 ///
+/// `brokered_unix_sockets` admits standalone Unix sockets in proxy-routed
+/// mode for a [`crate::unix_socket_supervisor::UnixSocketSupervisor`] that
+/// brokers every `connect()`.
+///
 /// Filesystem restrictions are normally handled by bubblewrap. The legacy
 /// Landlock implementation is only selected by `apply_landlock_fs`.
 pub(crate) fn apply_permission_profile_to_current_thread(
@@ -48,6 +52,7 @@ pub(crate) fn apply_permission_profile_to_current_thread(
     apply_landlock_fs: bool,
     managed_network: Option<&ManagedNetworkSandboxContext>,
     proxy_routing_active: bool,
+    brokered_unix_sockets: bool,
 ) -> Result<()> {
     let (file_system_sandbox_policy, network_sandbox_policy) =
         permission_profile.to_runtime_permissions();
@@ -76,7 +81,11 @@ pub(crate) fn apply_permission_profile_to_current_thread(
     }
 
     if let Some(mode) = network_seccomp_mode {
-        install_network_seccomp_filter_on_current_thread(mode, managed_network)?;
+        install_network_seccomp_filter_on_current_thread(
+            mode,
+            managed_network,
+            brokered_unix_sockets,
+        )?;
     }
 
     if apply_landlock_fs && !file_system_sandbox_policy.has_full_disk_write_access() {
@@ -97,6 +106,9 @@ pub(crate) fn apply_permission_profile_to_current_thread(
 
     Ok(())
 }
+
+/// The socket type in `socket(2)`'s type argument, below its flags.
+const SOCK_TYPE_MASK: u64 = 0xf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetworkSeccompMode {
@@ -181,6 +193,7 @@ fn install_filesystem_landlock_rules_on_current_thread(
 fn install_network_seccomp_filter_on_current_thread(
     mode: NetworkSeccompMode,
     managed_network: Option<&ManagedNetworkSandboxContext>,
+    brokered_unix_sockets: bool,
 ) -> std::result::Result<(), SandboxErr> {
     fn deny_syscall(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, nr: i64) {
         rules.insert(nr, vec![]); // empty rule vec = unconditional match
@@ -235,8 +248,9 @@ fn install_network_seccomp_filter_on_current_thread(
         NetworkSeccompMode::ProxyRouted => {
             // In proxy-routed mode we allow IP sockets in the isolated
             // namespace (used to reach the local TCP bridge). Standalone Unix
-            // sockets require an explicit managed-policy grant; all other
-            // socket families remain denied.
+            // sockets require an explicit managed-policy grant, or a
+            // supervisor brokering their connections; all other socket
+            // families remain denied.
             let mut denied_socket_conditions = vec![
                 SeccompCondition::new(
                     0,
@@ -251,7 +265,9 @@ fn install_network_seccomp_filter_on_current_thread(
                     libc::AF_INET6 as u64,
                 )?,
             ];
-            if managed_network.is_some_and(|context| context.dangerously_allow_all_unix_sockets) {
+            let allow_all_unix_sockets =
+                managed_network.is_some_and(|context| context.dangerously_allow_all_unix_sockets);
+            if allow_all_unix_sockets || brokered_unix_sockets {
                 denied_socket_conditions.push(SeccompCondition::new(
                     0,
                     SeccompCmpArgLen::Dword,
@@ -266,8 +282,33 @@ fn install_network_seccomp_filter_on_current_thread(
                 SeccompCmpOp::Ne,
                 libc::AF_UNIX as u64,
             )?])?;
-            rules.insert(libc::SYS_socket, vec![deny_non_ip_socket]);
-            rules.insert(libc::SYS_socketpair, vec![deny_non_unix_socketpair]);
+            let mut socket_rules = vec![deny_non_ip_socket];
+            let mut socketpair_rules = vec![deny_non_unix_socketpair];
+            if brokered_unix_sockets && !allow_all_unix_sockets {
+                // The supervisor brokers connect(), the only way a stream or
+                // seqpacket socket reaches a path. A datagram socket names a
+                // path on every send. AF_UNIX treats SOCK_RAW as SOCK_DGRAM.
+                for socket_type in [libc::SOCK_DGRAM, libc::SOCK_RAW] {
+                    let deny_unix_datagram = SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            0,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::AF_UNIX as u64,
+                        )?,
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
+                            socket_type as u64,
+                        )?,
+                    ])?;
+                    socket_rules.push(deny_unix_datagram.clone());
+                    socketpair_rules.push(deny_unix_datagram);
+                }
+            }
+            rules.insert(libc::SYS_socket, socket_rules);
+            rules.insert(libc::SYS_socketpair, socketpair_rules);
         }
         NetworkSeccompMode::VmSocketRestricted => {
             let deny_vsock = SeccompRule::new(vec![SeccompCondition::new(

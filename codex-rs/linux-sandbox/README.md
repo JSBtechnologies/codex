@@ -99,6 +99,19 @@ commands that would enter the bubblewrap path.
   inside the isolated network namespace and blocks new standalone `AF_UNIX`
   sockets unless `dangerously_allow_all_unix_sockets` is granted. Unix socket
   pairs remain allowed for communication between related processes.
+- In managed proxy mode with a `unix_sockets` allowlist, the helper brokers
+  every `connect()` through seccomp user notification (Linux 5.19 or newer).
+  A Unix stream or seqpacket socket may reach an allowed socket, a socket
+  beneath an allowed directory, or a socket bound inside the sandbox. Each
+  entry is resolved once at startup, a connection is judged by the socket it
+  reaches after symlinks, and abstract addresses are refused. As with
+  Seatbelt's subpath rules, a directory entry allows any socket moved into it,
+  so allow only directories untrusted code can't write to. Unix datagram
+  sockets stay blocked, because a datagram socket names its destination on
+  every send. A server sees the helper's pid in `SO_PEERCRED`. If the kernel or
+  sandbox can't support the broker (for example with `--no-proc`), the helper
+  prints a warning and standalone Unix sockets stay blocked. Allowed paths are
+  not mounted into restricted-read (`--tmpfs /`) sandboxes.
 - When bubblewrap is active, it mounts a fresh `/proc` via `--proc /proc` by default.
   If that mount is denied, it retains the inherited `/proc` and still creates a
   PID namespace, preserving the existing fallback. `--no-proc` also retains the

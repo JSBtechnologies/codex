@@ -25,6 +25,8 @@ use crate::launcher::preferred_bwrap_supports_argv0;
 use crate::proxy_routing::activate_proxy_routes_in_netns;
 use crate::proxy_routing::prepare_host_proxy_route_spec;
 use crate::seccomp::apply_permission_profile_to_current_thread;
+use crate::unix_socket_policy::UnixSocketPolicy;
+use crate::unix_socket_supervisor::UnixSocketSupervisor;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::PermissionProfile;
@@ -202,12 +204,16 @@ pub fn run_main() -> ! {
             }
         }
         let proxy_routing_active = allow_network_for_proxy;
+        let unix_socket_supervisor = managed_network
+            .as_ref()
+            .and_then(prepare_unix_socket_supervisor);
         if let Err(e) = apply_permission_profile_to_current_thread(
             &permission_profile,
             &sandbox_policy_cwd,
             /*apply_landlock_fs*/ false,
             managed_network.as_ref(),
             proxy_routing_active,
+            /*brokered_unix_sockets*/ unix_socket_supervisor.is_some(),
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
@@ -220,11 +226,19 @@ pub fn run_main() -> ! {
         }
 
         if command_pid == 0 {
+            if let Some(supervisor) = &unix_socket_supervisor {
+                supervisor.enter();
+            }
             reset_forwarded_signal_handlers_to_default();
             signal_mask.restore();
             exec_or_panic(command);
         }
 
+        if let Some(supervisor) = unix_socket_supervisor
+            && let Err(err) = supervisor.serve(command_pid)
+        {
+            panic!("failed to start the Unix socket supervisor: {err}");
+        }
         let signal_forwarders = install_bwrap_signal_forwarders(command_pid);
         signal_mask.restore();
         loop {
@@ -254,6 +268,7 @@ pub fn run_main() -> ! {
             /*apply_landlock_fs*/ false,
             managed_network.as_ref(),
             /*proxy_routing_active*/ false,
+            /*brokered_unix_sockets*/ false,
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
@@ -322,6 +337,7 @@ pub fn run_main() -> ! {
         /*apply_landlock_fs*/ true,
         managed_network.as_ref(),
         /*proxy_routing_active*/ false,
+        /*brokered_unix_sockets*/ false,
     ) {
         panic!("error applying legacy Linux sandbox restrictions: {e:?}");
     }
@@ -355,6 +371,29 @@ fn parse_permission_profile(value: &str) -> std::result::Result<PermissionProfil
 fn parse_managed_network(value: &str) -> std::result::Result<ManagedNetworkSandboxContext, String> {
     serde_json::from_str(value)
         .map_err(|err| format!("invalid managed network context JSON: {err}"))
+}
+
+/// Prepares enforcement of the managed network's Unix socket allowlist.
+/// Without it, seccomp keeps refusing standalone Unix sockets, as it does when
+/// nothing is allowed.
+fn prepare_unix_socket_supervisor(
+    managed_network: &ManagedNetworkSandboxContext,
+) -> Option<UnixSocketSupervisor> {
+    if managed_network.dangerously_allow_all_unix_sockets {
+        return None;
+    }
+    let policy = UnixSocketPolicy::resolve(&managed_network.allow_unix_sockets);
+    if policy.is_empty() {
+        return None;
+    }
+    UnixSocketSupervisor::prepare(policy)
+        .inspect_err(|err| {
+            eprintln!(
+                "codex-linux-sandbox: Unix socket allowlist not enforced, so standalone Unix \
+                 sockets stay blocked: {err}"
+            );
+        })
+        .ok()
 }
 
 fn resolve_permission_profile(

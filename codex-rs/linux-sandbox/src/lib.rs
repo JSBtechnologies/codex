@@ -28,6 +28,8 @@ mod seccomp;
 #[cfg(target_os = "linux")]
 mod unix_socket_policy;
 #[cfg(target_os = "linux")]
+mod unix_socket_supervisor;
+#[cfg(target_os = "linux")]
 mod wslg;
 
 #[cfg(target_os = "linux")]
