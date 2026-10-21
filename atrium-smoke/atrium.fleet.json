@@ -1,7 +1,6 @@
 {
   "fleets": {
     "codex-ctl-smoke": {
-      "grid": "1x1",
       "allow_ctl": true,
       "trust": "accept",
       "topics": ["smoke"],
@@ -9,7 +8,7 @@
       "agents": [
         {
           "name": "codex-probe",
-          "cmd": ["codex"],
+          "cmd": ["codex", "--trust-folder"],
           "cwd": "..",
           "prompt": "You are a smoke-test agent running inside atrium under codex's workspace sandbox. Run only the commands the kickoff lists, verbatim, and report their exact output. Do not edit any file except atrium-smoke/RESULT.md.",
           "kickoff": "Smoke test: can this sandboxed codex pane reach atrium's control socket? Run these shell commands one at a time and keep each one's full stdout/stderr and exit code: (1) `echo $ATRIUM_CTL` (2) `atrium ctl whoami` (3) `atrium ctl board set smoke status=ok agent=codex-probe` (4) `atrium ctl board get smoke` (5) `atrium ctl bus pub smoke msg=codex-ctl-ok` (6) `python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); s.connect('/tmp/codex-atrium-smoke-denied.sock')\"` which must FAIL with a permission error because that socket is not allowlisted (a server is listening there). Then write atrium-smoke/RESULT.md with a table of command, exit code and output, and a final line `VERDICT: PASS` if 2-5 succeeded and 6 failed with EPERM or EACCES, otherwise `VERDICT: FAIL`. Do not try to work around a refused command; a refusal is the result being measured."

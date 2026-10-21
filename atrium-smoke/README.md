@@ -45,8 +45,13 @@ One-time setup:
 
 ```sh
 codex login                    # the pane needs a signed-in codex
-cd .. && codex --no-daemon     # answer "Trust this folder?" once for the repo, then quit
 ```
+
+Folder trust is a choice in this fork. Either answer "Trust this folder?" once
+by running `codex` in the repo, or pass `--trust-folder`, which treats the
+working directory as trusted for that run only and writes nothing to
+`config.toml`. The fleet file passes it in the agent's `cmd`, so a hands-off
+launch never stalls on the prompt. `launch-check.sh` verifies both behaviors.
 
 A plain `codex` from a `cargo install` build fails with "this CLI has no complete
 local package": upstream now launches the TUI through a shared app-server daemon
