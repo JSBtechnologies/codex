@@ -12,6 +12,7 @@ use codex_network_proxy::NetworkProxyState;
 use codex_network_proxy::build_config_state;
 use pretty_assertions::assert_eq;
 use std::ffi::OsStr;
+use std::os::unix::net::UnixDatagram;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -283,6 +284,10 @@ async fn managed_proxy_unix_socket_allowlist_reaches_only_granted_sockets() {
     let service = host.join("service.sock");
     let _listeners = [&allowed, &unlisted, &beneath, &other]
         .map(|path| UnixListener::bind(path).expect("host Unix listener"));
+    let allowed_datagram = host.join("allowed.dgram");
+    let unlisted_datagram = host.join("unlisted.dgram");
+    let _datagrams = [&allowed_datagram, &unlisted_datagram]
+        .map(|path| UnixDatagram::bind(path).expect("host Unix datagram socket"));
     let to_allowed = links.join("to-allowed");
     let to_unlisted = links.join("to-unlisted");
     std::os::unix::fs::symlink(&allowed, &to_allowed).expect("symlink to allowed");
@@ -312,8 +317,16 @@ async fn managed_proxy_unix_socket_allowlist_reaches_only_granted_sockets() {
     });
 
     let probe = r#"
-import errno, os, socket, sys, urllib.parse
-allowed, unlisted, beneath, other, service, to_allowed, to_unlisted, own_dir = sys.argv[1:]
+import ctypes, errno, os, socket, sys, urllib.parse
+(allowed, unlisted, beneath, other, service, to_allowed, to_unlisted, own_dir,
+ allowed_datagram, unlisted_datagram) = sys.argv[1:]
+libc = ctypes.CDLL(None, use_errno=True)
+
+# Landlock enforces the allowlist from ABI 9 (Linux 7.1); older kernels use
+# the helper's connect() supervisor, which refuses datagram sockets.
+SYS_landlock_create_ruleset = 444
+landlock = libc.syscall(SYS_landlock_create_ruleset, None, 0, 1) >= 9
+denied = errno.EACCES if landlock else errno.EPERM
 
 def connect(path, kind=socket.SOCK_STREAM):
     client = socket.socket(socket.AF_UNIX, kind)
@@ -334,7 +347,7 @@ def refused(path, kind=socket.SOCK_STREAM):
     result = connect(path, kind)
     if isinstance(result, socket.socket):
         result.close()
-    assert result == errno.EPERM, ('expected EPERM', path, result)
+    assert result == denied, ('expected', denied, path, result)
 
 reaches(allowed)
 reaches(beneath)
@@ -342,7 +355,15 @@ reaches(to_allowed)
 refused(unlisted)
 refused(other)
 refused(to_unlisted)
-refused('\0codex-abstract')
+if landlock:
+    # Abstract sockets created inside the sandbox stay reachable.
+    own_abstract = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    own_abstract.bind('\0codex-own-abstract')
+    own_abstract.listen()
+    reaches('\0codex-own-abstract')
+    own_abstract.close()
+else:
+    assert connect('\0codex-abstract') == errno.EPERM
 
 os.chdir(os.path.dirname(allowed))
 reaches(os.path.basename(allowed))
@@ -355,16 +376,33 @@ for kind in (socket.SOCK_STREAM, socket.SOCK_SEQPACKET):
     listener.listen()
     reaches(own, kind)
     listener.close()
-refused(unlisted, socket.SOCK_SEQPACKET)
 
-for make in (lambda: socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM),
-             lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)):
+if landlock:
+    # Landlock checks addressed sends, so datagram sockets stay usable.
+    sender = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sender.sendto(b'x', allowed_datagram)
     try:
-        make()
+        sender.sendto(b'x', unlisted_datagram)
     except OSError as error:
-        assert error.errno == errno.EPERM, error
+        assert error.errno == errno.EACCES, error
     else:
-        raise AssertionError('Unix datagram socket unexpectedly allowed')
+        raise AssertionError('datagram to an unlisted socket unexpectedly sent')
+    sender.close()
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    left.send(b'x')
+    assert right.recv(1) == b'x'
+else:
+    # Landlock's hook runs after the socket type check, so only the
+    # supervisor refuses a seqpacket connect to a stream socket by policy.
+    refused(unlisted, socket.SOCK_SEQPACKET)
+    for make in (lambda: socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM),
+                 lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)):
+        try:
+            make()
+        except OSError as error:
+            assert error.errno == errno.EPERM, error
+        else:
+            raise AssertionError('Unix datagram socket unexpectedly allowed')
 left, right = socket.socketpair()
 left.sendall(b'x')
 assert right.recv(1) == b'x'
@@ -376,22 +414,21 @@ assert client.recv(4, socket.MSG_WAITALL) == b'done'
 refused(service)
 client.close()
 
-# The helper brokering connect() is this command's parent; it must not give
-# up its seccomp listener or its memory.
-import ctypes
-libc = ctypes.CDLL(None, use_errno=True)
-SYS_pidfd_getfd = 438
-helper = os.getppid()
-helper_pidfd = os.pidfd_open(helper)
-for fd in range(64):
-    if libc.syscall(SYS_pidfd_getfd, helper_pidfd, fd, 0) >= 0:
-        raise AssertionError(('took a descriptor from the sandbox helper', fd))
-try:
-    open(f'/proc/{helper}/mem', 'r+b').close()
-except OSError:
-    pass
-else:
-    raise AssertionError('opened the sandbox helper memory')
+if not landlock:
+    # The helper brokering connect() is this command's parent; it must not
+    # give up its seccomp listener or its memory.
+    SYS_pidfd_getfd = 438
+    helper = os.getppid()
+    helper_pidfd = os.pidfd_open(helper)
+    for fd in range(64):
+        if libc.syscall(SYS_pidfd_getfd, helper_pidfd, fd, 0) >= 0:
+            raise AssertionError(('took a descriptor from the sandbox helper', fd))
+    try:
+        open(f'/proc/{helper}/mem', 'r+b').close()
+    except OSError:
+        pass
+    else:
+        raise AssertionError('opened the sandbox helper memory')
 
 proxy_port = urllib.parse.urlsplit(os.environ['HTTP_PROXY']).port
 socket.create_connection(('127.0.0.1', proxy_port), timeout=2).close()
@@ -412,7 +449,7 @@ for family in (socket.AF_NETLINK, getattr(socket, 'AF_VSOCK', 40)):
     let output = run_managed_python(
         managed_network_config(
             /*dangerously_allow_all_unix_sockets*/ false,
-            &[&allowed, &granted_dir, &service],
+            &[&allowed, &granted_dir, &service, &allowed_datagram],
         ),
         probe,
         &[
@@ -424,6 +461,8 @@ for family in (socket.AF_NETLINK, getattr(socket, 'AF_VSOCK', 40)):
             to_allowed.as_os_str(),
             to_unlisted.as_os_str(),
             own_dir.as_os_str(),
+            allowed_datagram.as_os_str(),
+            unlisted_datagram.as_os_str(),
         ],
     )
     .await;

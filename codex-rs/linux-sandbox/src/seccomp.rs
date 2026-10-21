@@ -40,9 +40,8 @@ use seccompiler::apply_filter;
 /// - enabling `PR_SET_NO_NEW_PRIVS` when restrictions apply, and
 /// - installing seccomp restrictions for network isolation and VM sockets.
 ///
-/// `brokered_unix_sockets` admits standalone Unix sockets in proxy-routed
-/// mode for a [`crate::unix_socket_supervisor::UnixSocketSupervisor`] that
-/// brokers every `connect()`.
+/// `unix_socket_enforcement` admits standalone Unix sockets in proxy-routed
+/// mode when something enforces the managed network's Unix socket allowlist.
 ///
 /// Filesystem restrictions are normally handled by bubblewrap. The legacy
 /// Landlock implementation is only selected by `apply_landlock_fs`.
@@ -52,7 +51,7 @@ pub(crate) fn apply_permission_profile_to_current_thread(
     apply_landlock_fs: bool,
     managed_network: Option<&ManagedNetworkSandboxContext>,
     proxy_routing_active: bool,
-    brokered_unix_sockets: bool,
+    unix_socket_enforcement: UnixSocketEnforcement,
 ) -> Result<()> {
     let (file_system_sandbox_policy, network_sandbox_policy) =
         permission_profile.to_runtime_permissions();
@@ -84,7 +83,7 @@ pub(crate) fn apply_permission_profile_to_current_thread(
         install_network_seccomp_filter_on_current_thread(
             mode,
             managed_network,
-            brokered_unix_sockets,
+            unix_socket_enforcement,
         )?;
     }
 
@@ -105,6 +104,20 @@ pub(crate) fn apply_permission_profile_to_current_thread(
     }
 
     Ok(())
+}
+
+/// What enforces the managed network's Unix socket allowlist, which decides
+/// the standalone Unix sockets seccomp admits in proxy-routed mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnixSocketEnforcement {
+    /// Nothing: standalone Unix sockets need `dangerously_allow_all_unix_sockets`.
+    NotEnforced,
+    /// Landlock checks every `connect()` and addressed `sendmsg()`, so any
+    /// Unix socket is admitted.
+    Landlock,
+    /// [`crate::unix_socket_supervisor::UnixSocketSupervisor`] brokers
+    /// `connect()`; datagram sockets would get around it.
+    Supervisor,
 }
 
 /// The socket type in `socket(2)`'s type argument, below its flags.
@@ -193,7 +206,7 @@ fn install_filesystem_landlock_rules_on_current_thread(
 fn install_network_seccomp_filter_on_current_thread(
     mode: NetworkSeccompMode,
     managed_network: Option<&ManagedNetworkSandboxContext>,
-    brokered_unix_sockets: bool,
+    unix_socket_enforcement: UnixSocketEnforcement,
 ) -> std::result::Result<(), SandboxErr> {
     fn deny_syscall(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, nr: i64) {
         rules.insert(nr, vec![]); // empty rule vec = unconditional match
@@ -248,9 +261,8 @@ fn install_network_seccomp_filter_on_current_thread(
         NetworkSeccompMode::ProxyRouted => {
             // In proxy-routed mode we allow IP sockets in the isolated
             // namespace (used to reach the local TCP bridge). Standalone Unix
-            // sockets require an explicit managed-policy grant, or a
-            // supervisor brokering their connections; all other socket
-            // families remain denied.
+            // sockets require an explicit managed-policy grant, or an enforced
+            // allowlist; all other socket families remain denied.
             let mut denied_socket_conditions = vec![
                 SeccompCondition::new(
                     0,
@@ -267,7 +279,9 @@ fn install_network_seccomp_filter_on_current_thread(
             ];
             let allow_all_unix_sockets =
                 managed_network.is_some_and(|context| context.dangerously_allow_all_unix_sockets);
-            if allow_all_unix_sockets || brokered_unix_sockets {
+            if allow_all_unix_sockets
+                || unix_socket_enforcement != UnixSocketEnforcement::NotEnforced
+            {
                 denied_socket_conditions.push(SeccompCondition::new(
                     0,
                     SeccompCmpArgLen::Dword,
@@ -284,7 +298,9 @@ fn install_network_seccomp_filter_on_current_thread(
             )?])?;
             let mut socket_rules = vec![deny_non_ip_socket];
             let mut socketpair_rules = vec![deny_non_unix_socketpair];
-            if brokered_unix_sockets && !allow_all_unix_sockets {
+            if unix_socket_enforcement == UnixSocketEnforcement::Supervisor
+                && !allow_all_unix_sockets
+            {
                 // The supervisor brokers connect(), the only way a stream or
                 // seqpacket socket reaches a path. A datagram socket names a
                 // path on every send. AF_UNIX treats SOCK_RAW as SOCK_DGRAM.

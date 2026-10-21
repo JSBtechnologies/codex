@@ -3,8 +3,9 @@
 //!
 //! `permissions.<name>.network.unix_sockets` names the Unix-domain sockets a
 //! sandboxed command may connect to. macOS enforces it in Seatbelt; on Linux
-//! the supervisor in [`crate::unix_socket_supervisor`] enforces it with this
-//! policy.
+//! Landlock ([`crate::unix_socket_landlock`]) enforces this policy where the
+//! kernel supports it, and the supervisor in [`crate::unix_socket_supervisor`]
+//! elsewhere.
 //!
 //! Semantics, matching Seatbelt's `subpath` rules and Landlock's inode rules:
 //!
@@ -84,8 +85,9 @@ struct Pinned {
     path: PathBuf,
     id: FileId,
     /// Held so the inode stays allocated: its number can't be reused by
-    /// another file while the sandbox compares against it.
-    _fd: OwnedFd,
+    /// another file while the sandbox compares against it. Landlock rules
+    /// are added through it.
+    fd: OwnedFd,
 }
 
 /// The resolved allowlist.
@@ -114,7 +116,7 @@ impl UnixSocketPolicy {
             let pinned = Pinned {
                 path: resolved,
                 id: stat.id,
-                _fd: fd,
+                fd,
             };
             if stat.is_socket {
                 policy.sockets.push(pinned);
@@ -127,6 +129,14 @@ impl UnixSocketPolicy {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.sockets.is_empty() && self.dirs.is_empty()
+    }
+
+    /// The pinned handles of every entry, sockets and directories alike.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &OwnedFd> {
+        self.sockets
+            .iter()
+            .chain(&self.dirs)
+            .map(|pinned| &pinned.fd)
     }
 
     /// Is the socket behind `target` (an `O_PATH` handle to the file a
