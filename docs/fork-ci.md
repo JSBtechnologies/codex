@@ -12,13 +12,13 @@ the fork turns off, so a red check here is a real finding.
 
 `blocking-ci.yml` is the PR gate. In the fork it calls:
 
-| reusable workflow | what it checks |
-|---|---|
-| `blob-size-policy.yml` | no oversized blobs committed |
-| `cargo-deny.yml` | licenses and advisories |
-| `codespell.yml` | spelling |
-| `repo-checks.yml` | Cargo manifests inherit workspace settings, TUI/core boundary, Bazel clippy lints |
-| `rust-ci.yml` | format, clippy, tests for changed crates, `cargo shear`, the argument-comment lint for packages |
+| reusable workflow      | what it checks                                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------------------------- |
+| `blob-size-policy.yml` | no oversized blobs committed                                                                    |
+| `cargo-deny.yml`       | licenses and advisories                                                                         |
+| `codespell.yml`        | spelling                                                                                        |
+| `repo-checks.yml`      | Cargo manifests inherit workspace settings, TUI/core boundary, Bazel clippy lints               |
+| `rust-ci.yml`          | format, clippy, tests for changed crates, `cargo shear`, the argument-comment lint for packages |
 
 Removed from the gate in the fork, in the workflow file with a comment: the
 `bazel` and `sdk` calls. Inside `rust-ci.yml`, the "Argument comment lint -
