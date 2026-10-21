@@ -29,37 +29,6 @@ fn trusted_projects_override(cwd: &Path) -> toml::Value {
     toml::Value::Table(projects)
 }
 
-#[cfg(test)]
-mod trust_folder_tests {
-    use super::trusted_projects_override;
-    use std::path::Path;
-
-    #[test]
-    fn trusted_projects_override_marks_cwd_trusted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let value = trusted_projects_override(dir.path());
-        let projects = value.as_table().expect("projects table");
-        assert!(!projects.is_empty());
-        let literal = projects
-            .get(&dir.path().to_string_lossy().into_owned())
-            .expect("literal cwd key");
-        assert_eq!(
-            literal.get("trust_level").and_then(toml::Value::as_str),
-            Some("trusted")
-        );
-        for (_, project) in projects {
-            assert_eq!(
-                project.get("trust_level").and_then(toml::Value::as_str),
-                Some("trusted")
-            );
-        }
-        // A dot in the path must stay inside the key, not split it.
-        let dotted = Path::new("/srv/app.v2/repo");
-        let value = trusted_projects_override(dotted);
-        assert!(value.as_table().expect("table").contains_key("/srv/app.v2/repo"));
-    }
-}
-
 pub(super) async fn run_main_inner(
     mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
@@ -1067,4 +1036,40 @@ pub(super) async fn run_main_inner(
     }
 
     app_result
+}
+
+#[cfg(test)]
+mod trust_folder_tests {
+    use super::trusted_projects_override;
+    use std::path::Path;
+
+    #[test]
+    fn trusted_projects_override_marks_cwd_trusted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let value = trusted_projects_override(dir.path());
+        let projects = value.as_table().expect("projects table");
+        assert!(!projects.is_empty());
+        let literal = projects
+            .get(&dir.path().to_string_lossy().into_owned())
+            .expect("literal cwd key");
+        assert_eq!(
+            literal.get("trust_level").and_then(toml::Value::as_str),
+            Some("trusted")
+        );
+        for (_, project) in projects {
+            assert_eq!(
+                project.get("trust_level").and_then(toml::Value::as_str),
+                Some("trusted")
+            );
+        }
+        // A dot in the path must stay inside the key, not split it.
+        let dotted = Path::new("/srv/app.v2/repo");
+        let value = trusted_projects_override(dotted);
+        assert!(
+            value
+                .as_table()
+                .expect("table")
+                .contains_key("/srv/app.v2/repo")
+        );
+    }
 }
