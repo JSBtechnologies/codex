@@ -50,8 +50,8 @@ mode = "full" # default when unset; use "limited" for read-only mode
 # Omitted: true for MXC, false elsewhere. MXC rejects an effective false.
 # allow_local_binding = false
 
-# DANGEROUS (macOS-only): bypasses unix socket allowlisting and permits any
-# absolute socket path from `x-unix-socket`.
+# DANGEROUS: bypasses unix socket allowlisting. On macOS the proxy accepts any absolute
+# socket path from `x-unix-socket`; on Linux sandboxed commands may connect to any Unix socket.
 dangerously_allow_all_unix_sockets = false
 
 # Hosts must match the allowlist (unless denied).
@@ -76,7 +76,9 @@ action = ["strip_auth"]
 [permissions.workspace.network.mitm.actions.strip_auth]
 strip_request_headers = ["authorization"]
 
-# macOS-only: allows proxying to a unix socket when request includes `x-unix-socket: /path`.
+# On macOS, allows proxying to a unix socket when a request includes `x-unix-socket: /path`.
+# On Linux, allows sandboxed commands to connect to these sockets directly; see
+# `codex-rs/linux-sandbox/README.md` for how entries are matched and enforced.
 [permissions.workspace.network.unix_sockets]
 "/tmp/example.sock" = "allow"
 ```
@@ -231,6 +233,9 @@ Audit events intentionally avoid logging full URL/path/query data.
 
 - Unix socket proxying via the `x-unix-socket` header is **macOS-only**; other platforms will
   reject unix socket requests.
+- On Linux, the sandbox enforces the `unix_sockets` allowlist on the command's own Unix socket
+  connections instead (Landlock on Linux 7.1+, a seccomp broker on older kernels). See
+  [`linux-sandbox/README.md`](../linux-sandbox/README.md).
 - HTTPS tunneling uses rustls via Rama's `rama-tls-rustls`; this avoids BoringSSL/OpenSSL symbol
   collisions in mixed TLS dependency graphs.
 
@@ -261,8 +266,9 @@ what it can reasonably guarantee.
     `dangerously_allow_non_loopback_proxy`
 - when unix socket proxying is enabled, all proxy listeners are forced to loopback to avoid turning the
   proxy into a remote bridge into local daemons.
-- `dangerously_allow_all_unix_sockets = true` bypasses the unix socket allowlist entirely (still
-  macOS-only and absolute-path-only). Use only in tightly controlled environments.
+- `dangerously_allow_all_unix_sockets = true` bypasses the unix socket allowlist entirely. For
+  `x-unix-socket` proxying it is macOS-only and absolute-path-only; on Linux it lets sandboxed
+  commands connect to any Unix socket. Use only in tightly controlled environments.
 - `enabled` is enforced at runtime; when false the proxy no-ops and does not bind listeners.
   Limitations:
 
