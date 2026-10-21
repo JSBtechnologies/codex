@@ -1,0 +1,268 @@
+# Fork release: prebuilt Codex packages for this fork (JSBtechnologies/codex).
+#
+# This is the fork's counterpart to upstream's rust-release.yml, which needs
+# OpenAI's self-hosted runners, signing, Bazel and R2. This one runs on
+# GitHub-hosted runners and publishes the same artifact upstream ships: a
+# "Codex package" (codex-package-<target>.tar.gz) holding bin/codex,
+# bin/codex-code-mode-host, codex-resources/bwrap and codex-path/rg, built by
+# the upstream package builder (scripts/build_codex_package.py).
+#
+# Everything is explicitly fork-labelled so it can never be mistaken for an
+# upstream release:
+#   - tags are fork-v<semver> (upstream uses rust-v<semver>)
+#   - the binary reports <semver>+fork (`codex --version`)
+#   - the GitHub release title and notes say it is the fork
+#
+# Release:  git tag fork-v0.1.0 && git push origin fork-v0.1.0
+# Install:  curl -fsSL https://github.com/JSBtechnologies/codex/releases/latest/download/install-fork.sh | sh
+#
+# Linux first. Windows needs codex-command-runner.exe and
+# codex-windows-sandbox-setup.exe in the package plus Authenticode signing; see
+# upstream's rust-release-windows.yml when adding it.
+
+name: fork-release
+
+on:
+  push:
+    tags:
+      - "fork-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (semver, e.g. 0.1.0). Builds the package only; no release is created."
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORK_REPO: JSBtechnologies/codex
+
+jobs:
+  resolve-version:
+    name: Resolve fork version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      is_release: ${{ steps.v.outputs.is_release }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            [[ "$tag" == fork-v* ]] || { echo "tag '$tag' must start with fork-v"; exit 1; }
+            version="${tag#fork-v}"
+            is_release=true
+          else
+            version="${{ github.event.inputs.version }}"
+            tag="fork-v${version}"
+            is_release=false
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+            || { echo "version '$version' is not semver"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
+          echo "fork version $version (tag $tag, release=$is_release)"
+
+  build:
+    name: Build package - ${{ matrix.target }}
+    needs: resolve-version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc build. The package needs the builder's glibc or newer, so
+          # build on the oldest supported runner. Add
+          # x86_64-unknown-linux-musl (static, needs Zig + musl tools; see
+          # .github/scripts/install-musl-build-tools.sh) once this is green.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # The release profile keeps line tables; the package copies are stripped.
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: off
+      STABLE_GIT_COMMIT: ${{ github.sha }}
+      CODEX_REPO_ROOT: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h / | tail -n 1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -n 1
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # pkg-config + libssl-dev: openssl-sys; libcap-dev: the bwrap helper;
+          # zstd: the .tar.zst package archive.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential pkg-config libssl-dev libcap-dev zstd python3
+
+      # The package builder uses tomllib (Python 3.11+); ubuntu-22.04 ships 3.10.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          key: fork-release-${{ matrix.target }}
+
+      - name: Stamp fork version into the workspace
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Workspace version is 0.0.0 on main; upstream stamps it at release
+          # time too. "+fork" is semver build metadata, so cargo and the
+          # package manifest accept it and `codex --version` says it is the fork.
+          fork_version="${VERSION}+fork"
+          sed -i "0,/^version = \"0.0.0\"/s//version = \"${fork_version}\"/" codex-rs/Cargo.toml
+          grep -m1 '^version' codex-rs/Cargo.toml
+          # Refresh Cargo.lock entries for workspace members only.
+          (cd codex-rs && cargo update --workspace --offline 2>/dev/null || cargo update --workspace)
+          echo "FORK_VERSION=${fork_version}" >> "$GITHUB_ENV"
+
+      - name: Build Codex package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Builds codex, codex-code-mode-host and bwrap with cargo, fetches
+          # the pinned ripgrep, strips the package copies and writes the
+          # archives. RUSTY_V8_MIRROR/_TAG come from .cargo/config.toml.
+          python3 scripts/build_codex_package.py \
+            --target "${{ matrix.target }}" \
+            --variant codex \
+            --cargo-profile release \
+            --strip all \
+            --package-version "${FORK_VERSION}" \
+            --package-dir "${RUNNER_TEMP}/codex-package-${{ matrix.target }}" \
+            --archive-output "dist/codex-package-${{ matrix.target }}.tar.gz" \
+            --archive-output "dist/codex-package-${{ matrix.target }}.tar.zst" \
+            --force
+          ls -l dist
+          cat "${RUNNER_TEMP}/codex-package-${{ matrix.target }}/codex-package.json"
+
+      - name: Smoke test the package
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="${RUNNER_TEMP}/codex-package-${{ matrix.target }}"
+          "$pkg/bin/codex" --version | tee /dev/stderr | grep -F "${FORK_VERSION}"
+          "$pkg/bin/codex" --help | grep -q -- "--trust-folder"
+          test -x "$pkg/bin/codex-code-mode-host"
+          test -x "$pkg/codex-resources/bwrap"
+          test -x "$pkg/codex-path/rg"
+          # A fresh tarball must round-trip to the same layout.
+          mkdir -p "${RUNNER_TEMP}/roundtrip"
+          tar -xzf "dist/codex-package-${{ matrix.target }}.tar.gz" -C "${RUNNER_TEMP}/roundtrip"
+          "${RUNNER_TEMP}/roundtrip/bin/codex" --version
+          echo "glibc floor: $(objdump -T "$pkg/bin/codex" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n 1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-package-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish fork release
+    needs: [resolve-version, build]
+    if: needs.resolve-version.outputs.is_release == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp scripts/install/install-fork.sh dist/install-fork.sh
+          (cd dist && sha256sum codex-package-*.tar.gz codex-package-*.tar.zst > codex-package_SHA256SUMS)
+          ls -l dist
+          cat dist/codex-package_SHA256SUMS
+
+      - name: Write release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          **This is a release of the JSBtechnologies fork of Codex, not an OpenAI release.**
+
+          Fork version: \`${VERSION}+fork\` (tag \`${TAG}\`, commit \`${GITHUB_SHA}\`).
+
+          What this fork adds on top of upstream:
+          - Unix-socket allowlist enforcement in the Linux sandbox (seccomp broker on Linux 5.19+, Landlock on 7.1+), so sandboxed agents can reach an allowlisted control socket such as atrium's and nothing else.
+          - \`--trust-folder\`: trust the working directory for one run without writing config.
+          - \`daemon_auto_start\` off by default.
+
+          ## Install (Linux x86_64)
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${FORK_REPO}/releases/download/${TAG}/install-fork.sh | sh
+          \`\`\`
+
+          Installs into \`~/.codex/packages/standalone\` and links \`~/.local/bin/codex\`, the same layout as upstream's standalone installer. Set \`CODEX_INSTALL_DIR\` to change the bin dir. Needs glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, WSL2 Ubuntu).
+
+          ## Assets
+          - \`codex-package-<target>.tar.gz\` / \`.tar.zst\`: the Codex package (bin/codex, bin/codex-code-mode-host, codex-resources/bwrap, codex-path/rg, codex-package.json)
+          - \`codex-package_SHA256SUMS\`: checksums the installer verifies
+          - \`install-fork.sh\`: the installer
+          EOF
+          cat notes.md
+
+      - name: Create or update the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          title="Codex fork v${VERSION} (JSBtechnologies)"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$title" --notes-file notes.md
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$title" --notes-file notes.md --latest
+          fi
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
