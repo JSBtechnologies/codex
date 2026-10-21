@@ -129,10 +129,16 @@ jobs:
           toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
+      # Cache the registry only, never target/. A restored target/ marks the
+      # `v8` build script as fresh while its downloaded static library is not
+      # in the cache, and the build then fails with "could not find native
+      # static library `rusty_v8`" (seen on the first tag run). A release build
+      # is a full LTO build anyway, so the target cache bought almost nothing.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
           key: fork-release-${{ matrix.target }}
+          cache-targets: "false"
 
       - name: Stamp fork version into the workspace
         shell: bash
