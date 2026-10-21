@@ -7,6 +7,59 @@ use super::*;
 use codex_terminal_detection::Multiplexer;
 use codex_terminal_detection::TerminalName;
 
+/// A `projects` table marking `cwd` trusted, keyed by both its literal spelling
+/// and its normalized spelling so the project lookup matches whichever it tries.
+fn trusted_projects_override(cwd: &Path) -> toml::Value {
+    let mut project = toml::value::Table::new();
+    project.insert(
+        "trust_level".to_string(),
+        toml::Value::String("trusted".to_string()),
+    );
+    let mut projects = toml::value::Table::new();
+    if let Ok(canonical) = codex_utils_path::normalize_for_path_comparison(cwd) {
+        projects.insert(
+            canonical.to_string_lossy().into_owned(),
+            toml::Value::Table(project.clone()),
+        );
+    }
+    projects.insert(
+        cwd.to_string_lossy().into_owned(),
+        toml::Value::Table(project),
+    );
+    toml::Value::Table(projects)
+}
+
+#[cfg(test)]
+mod trust_folder_tests {
+    use super::trusted_projects_override;
+    use std::path::Path;
+
+    #[test]
+    fn trusted_projects_override_marks_cwd_trusted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let value = trusted_projects_override(dir.path());
+        let projects = value.as_table().expect("projects table");
+        assert!(!projects.is_empty());
+        let literal = projects
+            .get(&dir.path().to_string_lossy().into_owned())
+            .expect("literal cwd key");
+        assert_eq!(
+            literal.get("trust_level").and_then(toml::Value::as_str),
+            Some("trusted")
+        );
+        for (_, project) in projects {
+            assert_eq!(
+                project.get("trust_level").and_then(toml::Value::as_str),
+                Some("trusted")
+            );
+        }
+        // A dot in the path must stay inside the key, not split it.
+        let dotted = Path::new("/srv/app.v2/repo");
+        let value = trusted_projects_override(dotted);
+        assert!(value.as_table().expect("table").contains_key("/srv/app.v2/repo"));
+    }
+}
+
 pub(super) async fn run_main_inner(
     mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
@@ -93,6 +146,27 @@ pub(super) async fn run_main_inner(
     {
         return Err(std::io::Error::other(
             "sandbox_workspace_write.writable_roots overrides are not supported with --remote. Configure additional workspace roots on the server.",
+        ));
+    }
+    if cli.trust_folder {
+        if explicit_remote_endpoint.is_some() {
+            return Err(std::io::Error::other(
+                "--trust-folder is only supported for local sessions",
+            ));
+        }
+        // Layer an in-memory `projects.<cwd>.trust_level = "trusted"` on top of
+        // the loaded config so the folder-trust prompt is skipped for this run
+        // without touching config.toml. Built as a TOML table rather than a
+        // dotted `-c` key because the override parser splits keys on every dot,
+        // which would break any path containing one.
+        let current_dir = std::env::current_dir()?;
+        let trust_cwd = match cli.cwd.as_deref() {
+            Some(cwd) => current_dir.join(cwd),
+            None => current_dir,
+        };
+        cli_kv_overrides.push((
+            "projects".to_string(),
+            trusted_projects_override(&trust_cwd),
         ));
     }
 

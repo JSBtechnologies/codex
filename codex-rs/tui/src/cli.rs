@@ -88,6 +88,13 @@ pub struct Cli {
     #[arg(long)]
     pub no_daemon: bool,
 
+    /// Treat the working directory as trusted for this run only, skipping the
+    /// "Trust this folder?" prompt. Nothing is written to config.toml. Meant for
+    /// launchers and agent orchestrators that already vet the directory; local
+    /// sessions only.
+    #[arg(long = "trust-folder", default_value_t = false)]
+    pub trust_folder: bool,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }
