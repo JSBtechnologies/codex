@@ -19,6 +19,18 @@ pub(crate) fn is_source_build_version(version: &str) -> bool {
     parse_version(version) == Some((0, 0, 0))
 }
 
+/// Fork releases stamp `+fork` build metadata into the version
+/// (`.github/workflows/fork-release.yml`). Upstream's update check compares
+/// against openai/codex releases, which a fork can never "upgrade" to, so such
+/// builds skip it like a source build does.
+#[cfg(any(not(debug_assertions), test))]
+pub(crate) fn is_fork_build_version(version: &str) -> bool {
+    version
+        .split('+')
+        .nth(1)
+        .is_some_and(|meta| meta == "fork" || meta.starts_with("fork."))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ServerVersionNoticeKind {
     Older,
@@ -88,6 +100,15 @@ mod tests {
     fn source_build_version_is_not_checked() {
         assert!(is_source_build_version("0.0.0"));
         assert!(!is_source_build_version("0.1.0"));
+    }
+
+    #[test]
+    fn detects_fork_build_versions() {
+        assert!(is_fork_build_version("0.1.0+fork"));
+        assert!(is_fork_build_version("0.1.0+fork.jsb"));
+        assert!(!is_fork_build_version("0.1.0"));
+        assert!(!is_fork_build_version("0.1.0+build.5"));
+        assert!(!is_fork_build_version("0.1.0-forky"));
     }
 
     #[test]
