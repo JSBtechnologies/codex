@@ -8,6 +8,7 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 </br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
 <strong>This fork has an implementation of a broker design. The helper intercepts connect() with seccomp user notification, copies the address, takes the socket with pidfd_getfd, and connects itself through an O_PATH handle to the checked socket. It never continues the call in the kernel. Entries are pinned by inode at startup and judged after symlinks; abstract addresses are refused; sockets bound inside the sandbox stay reachable. Unix datagram sockets are refused because they name a destination on every send; seqpacket ignores the sendto address, so it stays allowed. If the kernel can't support it, it fails closed and keeps today's EPERM. <br>
 On Linux 7.1+ the fork uses Landlock (<code>LANDLOCK_ACCESS_FS_RESOLVE_UNIX</code>) instead: the kernel checks connect() and addressed sends itself, so Unix datagram sockets work there, and the broker covers older kernels.</strong> 
+<br>To use it, list the allowed sockets under <code>[permissions.&lt;profile&gt;.network.unix_sockets]</code> with the managed network proxy enabled. See <a href="codex-rs/linux-sandbox/README.md">codex-rs/linux-sandbox/README.md</a> for the matching rules and per-kernel behavior.
 
 ## Quickstart
 
