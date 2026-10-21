@@ -1055,7 +1055,11 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::DaemonAutoStart,
         key: "daemon_auto_start",
         stage: Stage::Stable,
-        default_enabled: true,
+        // Off by default in this fork: the shared app-server daemon installs
+        // itself from a packaged release, which a `cargo install` build does not
+        // carry, so a plain `codex` launch would fail with "this CLI has no
+        // complete local package". Opt back in with `features.daemon_auto_start = true`.
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::AppServerWebSocketCompression,
