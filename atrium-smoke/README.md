@@ -1,5 +1,26 @@
 # atrium smoke tests for this codex fork
 
+## Installing from source
+
+`cargo install --path cli` gives you `codex`, but codex runs shell commands
+through a sibling helper that the release package ships next to it in `bin/`.
+A local build needs that helper installed into the same directory too, or every
+command fails before it runs with "codex-code-mode-host is missing":
+
+```sh
+cd codex-rs
+cargo install --path cli --locked
+cargo install --path code-mode-host --locked
+```
+
+(`rg` and `bwrap` are the only other runtime pieces, and system ones on PATH work.)
+
+The host embeds V8 and downloads a prebuilt at build time. The sandbox-enabled
+build the workspace needs is published under OpenAI's `rusty-v8-v<version>`
+release tag, not on denoland/rusty_v8, so the repo's `.cargo/config.toml` points
+`RUSTY_V8_MIRROR` / `RUSTY_V8_MIRROR_TAG` there by default. Build from inside
+the repo so that config applies.
+
 This fork adds a Unix-socket allowlist to the Linux sandbox
 (`[permissions.<profile>.network.unix_sockets]`, see `codex-rs/linux-sandbox/README.md`).
 atrium uses exactly that to let a sandboxed codex pane reach its control socket
