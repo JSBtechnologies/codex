@@ -3,3 +3,13 @@
 # Cargo passes this to all child processes, including tests and cargo run.
 # An explicit MALLOC_CONF (even empty) keeps precedence.
 MALLOC_CONF = { value = "thp:always", force = false }
+
+# The `v8` crate (via codex-code-mode-host) downloads a prebuilt V8 at build
+# time. The workspace enables `v8_enable_sandbox`, and the sandbox-enabled
+# ptrcomp builds are not published on denoland/rusty_v8's releases; OpenAI
+# hosts them under its own tag (the same artifacts MODULE.bazel pins). Without
+# this, a plain `cargo build` or `cargo install --path code-mode-host` fails
+# with "Failed to fetch the V8 prebuilt artifact ... 404". An explicit
+# RUSTY_V8_MIRROR / RUSTY_V8_MIRROR_TAG in the environment still wins.
+RUSTY_V8_MIRROR = { value = "https://github.com/openai/codex/releases/download", force = false }
+RUSTY_V8_MIRROR_TAG = { value = "rusty-v8-v152.2.0", force = false }
