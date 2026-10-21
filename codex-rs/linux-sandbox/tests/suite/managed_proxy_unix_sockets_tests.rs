@@ -1,4 +1,5 @@
-//! Explicit Unix-socket grants preserve managed-proxy network isolation.
+//! Unix-socket grants under the managed proxy: explicit grants reach only the
+//! granted sockets, and never widen network isolation.
 
 use super::*;
 use codex_network_proxy::ConfigReloader;
@@ -10,9 +11,13 @@ use codex_network_proxy::NetworkProxyConstraints;
 use codex_network_proxy::NetworkProxyState;
 use codex_network_proxy::build_config_state;
 use pretty_assertions::assert_eq;
+use std::ffi::OsStr;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+
+/// Printed by the helper when the kernel or sandbox can't enforce an allowlist.
+const ALLOWLIST_NOT_ENFORCED: &str = "Unix socket allowlist not enforced";
 
 struct TestConfigReloader(ConfigState);
 
@@ -30,11 +35,76 @@ impl ConfigReloader for TestConfigReloader {
     }
 }
 
-#[tokio::test]
-async fn managed_proxy_allow_all_unix_sockets_preserves_network_isolation() {
+fn managed_network_config(
+    dangerously_allow_all_unix_sockets: bool,
+    allow_unix_sockets: &[&Path],
+) -> NetworkProxyConfig {
+    let mut config = NetworkProxyConfig {
+        enabled: true,
+        proxy_url: "http://127.0.0.1:9".to_string(),
+        dangerously_allow_all_unix_sockets: Some(dangerously_allow_all_unix_sockets),
+        ..Default::default()
+    };
+    if !allow_unix_sockets.is_empty() {
+        config.set_allow_unix_sockets(
+            allow_unix_sockets
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        );
+    }
+    config
+}
+
+/// Runs a python3 `probe` under the managed proxy with `config`.
+async fn run_managed_python(
+    config: NetworkProxyConfig,
+    probe: &str,
+    args: &[&OsStr],
+) -> std::process::Output {
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+    let state = build_config_state(
+        config,
+        NetworkProxyConstraints::default(),
+        codex_network_proxy::Platform::native(),
+    )
+    .expect("valid managed network configuration");
+    let network = NetworkProxy::builder()
+        .state(Arc::new(NetworkProxyState::with_reloader(
+            state.clone(),
+            Arc::new(TestConfigReloader(state)),
+        )))
+        .managed_by_codex(/*managed_by_codex*/ false)
+        .build()
+        .await
+        .expect("build managed network proxy");
+    let prepared = network
+        .prepare_for_optional_environment(env, /*environment_id*/ None)
+        .expect("prepare managed network policy");
+    let cwd = std::env::current_dir().expect("current directory");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codex-linux-sandbox"));
+    command
+        .arg("--sandbox-policy-cwd")
+        .arg(&cwd)
+        .arg("--permission-profile")
+        .arg(serde_json::to_string(&PermissionProfile::Disabled).unwrap())
+        .arg("--managed-network")
+        .arg(serde_json::to_string(&prepared.sandbox_context).unwrap())
+        .args(["--", "python3", "-c", probe])
+        .args(args)
+        .env_clear()
+        .envs(prepared.env)
+        .kill_on_drop(true);
+    tokio::time::timeout(OPERATION_TIMEOUT, command.output())
+        .await
+        .expect("Unix socket probe timed out")
+        .expect("Unix socket probe should execute")
+}
+
+async fn unix_socket_skip_reason() -> Option<String> {
     if let Some(reason) = managed_proxy_skip_reason().await {
-        eprintln!("skipping managed proxy Unix socket test: {reason}");
-        return;
+        return Some(reason);
     }
     if !Command::new("python3")
         .arg("--version")
@@ -42,9 +112,43 @@ async fn managed_proxy_allow_all_unix_sockets_preserves_network_isolation() {
         .await
         .is_ok_and(|output| output.status.success())
     {
-        eprintln!("skipping managed proxy Unix socket test: python3 is unavailable");
+        return Some("python3 is unavailable".to_string());
+    }
+    None
+}
+
+/// Why this kernel or sandbox can't enforce an allowlist, if it can't.
+async fn allowlist_unsupported_reason() -> Option<String> {
+    let temp = tempfile::tempdir().expect("socket directory");
+    let socket_path = temp.path().join("probe.sock");
+    let _listener = UnixListener::bind(&socket_path).expect("host Unix listener");
+    let output = run_managed_python(
+        managed_network_config(
+            /*dangerously_allow_all_unix_sockets*/ false,
+            &[&socket_path],
+        ),
+        "import socket; socket.socket(socket.AF_UNIX).close()",
+        &[],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    (!output.status.success() && stderr.contains(ALLOWLIST_NOT_ENFORCED))
+        .then(|| stderr.trim().to_string())
+}
+
+#[tokio::test]
+async fn managed_proxy_allow_all_unix_sockets_preserves_network_isolation() {
+    if let Some(reason) = unix_socket_skip_reason().await {
+        eprintln!("skipping managed proxy Unix socket test: {reason}");
         return;
     }
+    let allowlist_enforced = match allowlist_unsupported_reason().await {
+        None => true,
+        Some(reason) => {
+            eprintln!("Unix socket allowlist unsupported, expecting denial: {reason}");
+            false
+        }
+    };
 
     let temp = tempfile::tempdir().expect("socket directory");
     let socket_path = temp.path().join("daemon.sock");
@@ -66,12 +170,19 @@ async fn managed_proxy_allow_all_unix_sockets_preserves_network_isolation() {
     let _tcp_control = TcpStream::connect(tcp_addr).expect("host TCP control connection");
     let _tcp_peer = tcp_listener.accept().expect("accept host TCP control");
 
+    let cases = [
+        ("default denial", false, false, false),
+        ("path grant", false, true, allowlist_enforced),
+        ("explicit allow-all", true, false, true),
+    ];
+    let expected_connections = cases.iter().filter(|(.., allowed)| *allowed).count();
     listener
         .set_nonblocking(true)
         .expect("nonblocking listener");
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + OPERATION_TIMEOUT * 2;
-        loop {
+        let deadline = Instant::now() + OPERATION_TIMEOUT * 4;
+        let mut served = 0;
+        while served < expected_connections {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     stream
@@ -81,7 +192,7 @@ async fn managed_proxy_allow_all_unix_sockets_preserves_network_isolation() {
                     stream.read_exact(&mut request).expect("read Unix request");
                     assert_eq!(request, *b"ping");
                     stream.write_all(b"pong").expect("write Unix response");
-                    break;
+                    served += 1;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "Unix request timed out");
@@ -123,64 +234,19 @@ for family in (socket.AF_NETLINK, getattr(socket, 'AF_VSOCK', 40)):
         unexpected.close()
         raise AssertionError(('socket family unexpectedly allowed', family))
 "#;
-    let cwd = std::env::current_dir().expect("current directory");
-    for (label, dangerously_allow_all_unix_sockets, allow_path) in [
-        ("default denial", false, false),
-        ("path grant stays restricted", false, true),
-        ("explicit allow-all", true, false),
-    ] {
-        let mut env = create_env_from_core_vars();
-        strip_proxy_env(&mut env);
-        let mut config = NetworkProxyConfig {
-            enabled: true,
-            proxy_url: "http://127.0.0.1:9".to_string(),
-            dangerously_allow_all_unix_sockets: Some(dangerously_allow_all_unix_sockets),
-            ..Default::default()
-        };
-        if allow_path {
-            config.set_allow_unix_sockets(vec![socket_path.to_string_lossy().into_owned()]);
-        }
-        let state = build_config_state(
-            config,
-            NetworkProxyConstraints::default(),
-            codex_network_proxy::Platform::native(),
+    let port = tcp_addr.port().to_string();
+    for (label, dangerously_allow_all_unix_sockets, grant_path, allowed) in cases {
+        let granted: &[&Path] = if grant_path { &[&socket_path] } else { &[] };
+        let output = run_managed_python(
+            managed_network_config(dangerously_allow_all_unix_sockets, granted),
+            probe,
+            &[
+                socket_path.as_os_str(),
+                OsStr::new(&port),
+                OsStr::new(if allowed { "allow" } else { "deny" }),
+            ],
         )
-        .expect("valid managed network configuration");
-        let network = NetworkProxy::builder()
-            .state(Arc::new(NetworkProxyState::with_reloader(
-                state.clone(),
-                Arc::new(TestConfigReloader(state)),
-            )))
-            .managed_by_codex(/*managed_by_codex*/ false)
-            .build()
-            .await
-            .expect("build managed network proxy");
-        let prepared = network
-            .prepare_for_optional_environment(env, /*environment_id*/ None)
-            .expect("prepare managed network policy");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_codex-linux-sandbox"));
-        command
-            .arg("--sandbox-policy-cwd")
-            .arg(&cwd)
-            .arg("--permission-profile")
-            .arg(serde_json::to_string(&PermissionProfile::Disabled).unwrap())
-            .arg("--managed-network")
-            .arg(serde_json::to_string(&prepared.sandbox_context).unwrap())
-            .args(["--", "python3", "-c", probe])
-            .arg(&socket_path)
-            .arg(tcp_addr.port().to_string())
-            .arg(if dangerously_allow_all_unix_sockets {
-                "allow"
-            } else {
-                "deny"
-            })
-            .env_clear()
-            .envs(prepared.env)
-            .kill_on_drop(true);
-        let output = tokio::time::timeout(OPERATION_TIMEOUT, command.output())
-            .await
-            .expect("Unix socket probe timed out")
-            .expect("Unix socket probe should execute");
+        .await;
         assert!(
             output.status.success(),
             "{label}; stderr={}",
@@ -188,4 +254,183 @@ for family in (socket.AF_NETLINK, getattr(socket, 'AF_VSOCK', 40)):
         );
     }
     server.join().expect("Unix server should finish");
+}
+
+#[tokio::test]
+async fn managed_proxy_unix_socket_allowlist_reaches_only_granted_sockets() {
+    if let Some(reason) = unix_socket_skip_reason().await {
+        eprintln!("skipping Unix socket allowlist test: {reason}");
+        return;
+    }
+    if let Some(reason) = allowlist_unsupported_reason().await {
+        eprintln!("skipping Unix socket allowlist test: {reason}");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("socket directory");
+    let host = temp.path().join("host");
+    let granted_dir = temp.path().join("granted-dir");
+    let other_dir = temp.path().join("other-dir");
+    let links = temp.path().join("links");
+    let own_dir = temp.path().join("own");
+    for dir in [&host, &granted_dir, &other_dir, &links, &own_dir] {
+        std::fs::create_dir(dir).expect("create socket directory");
+    }
+    let allowed = host.join("allowed.sock");
+    let unlisted = host.join("unlisted.sock");
+    let beneath = granted_dir.join("beneath.sock");
+    let other = other_dir.join("other.sock");
+    let service = host.join("service.sock");
+    let _listeners = [&allowed, &unlisted, &beneath, &other]
+        .map(|path| UnixListener::bind(path).expect("host Unix listener"));
+    let to_allowed = links.join("to-allowed");
+    let to_unlisted = links.join("to-unlisted");
+    std::os::unix::fs::symlink(&allowed, &to_allowed).expect("symlink to allowed");
+    std::os::unix::fs::symlink(&unlisted, &to_unlisted).expect("symlink to unlisted");
+
+    // The service is replaced while the command runs: the replacement is a
+    // different socket from the one granted when the sandbox started.
+    let service_listener = UnixListener::bind(&service).expect("service listener");
+    let service_path = service.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = service_listener.accept().expect("accept service request");
+        stream
+            .set_read_timeout(Some(OPERATION_TIMEOUT))
+            .expect("set service read timeout");
+        let mut request = [0; 4];
+        stream
+            .read_exact(&mut request)
+            .expect("read service request");
+        assert_eq!(request, *b"swap");
+        drop(service_listener);
+        std::fs::remove_file(&service_path).expect("remove original service");
+        let replacement = UnixListener::bind(&service_path).expect("replacement listener");
+        stream.write_all(b"done").expect("write service response");
+        let mut closed = [0; 1];
+        let _ = stream.read(&mut closed);
+        drop(replacement);
+    });
+
+    let probe = r#"
+import errno, os, socket, sys, urllib.parse
+allowed, unlisted, beneath, other, service, to_allowed, to_unlisted, own_dir = sys.argv[1:]
+
+def connect(path, kind=socket.SOCK_STREAM):
+    client = socket.socket(socket.AF_UNIX, kind)
+    client.settimeout(2)
+    try:
+        client.connect(path)
+    except OSError as error:
+        client.close()
+        return error.errno
+    return client
+
+def reaches(path, kind=socket.SOCK_STREAM):
+    client = connect(path, kind)
+    assert isinstance(client, socket.socket), ('expected to connect', path, client)
+    client.close()
+
+def refused(path, kind=socket.SOCK_STREAM):
+    result = connect(path, kind)
+    if isinstance(result, socket.socket):
+        result.close()
+    assert result == errno.EPERM, ('expected EPERM', path, result)
+
+reaches(allowed)
+reaches(beneath)
+reaches(to_allowed)
+refused(unlisted)
+refused(other)
+refused(to_unlisted)
+refused('\0codex-abstract')
+
+os.chdir(os.path.dirname(allowed))
+reaches(os.path.basename(allowed))
+refused(os.path.basename(unlisted))
+
+for kind in (socket.SOCK_STREAM, socket.SOCK_SEQPACKET):
+    own = os.path.join(own_dir, f'own-{kind}.sock')
+    listener = socket.socket(socket.AF_UNIX, kind)
+    listener.bind(own)
+    listener.listen()
+    reaches(own, kind)
+    listener.close()
+refused(unlisted, socket.SOCK_SEQPACKET)
+
+for make in (lambda: socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM),
+             lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)):
+    try:
+        make()
+    except OSError as error:
+        assert error.errno == errno.EPERM, error
+    else:
+        raise AssertionError('Unix datagram socket unexpectedly allowed')
+left, right = socket.socketpair()
+left.sendall(b'x')
+assert right.recv(1) == b'x'
+
+client = connect(service)
+assert isinstance(client, socket.socket), client
+client.sendall(b'swap')
+assert client.recv(4, socket.MSG_WAITALL) == b'done'
+refused(service)
+client.close()
+
+# The helper brokering connect() is this command's parent; it must not give
+# up its seccomp listener or its memory.
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+SYS_pidfd_getfd = 438
+helper = os.getppid()
+helper_pidfd = os.pidfd_open(helper)
+for fd in range(64):
+    if libc.syscall(SYS_pidfd_getfd, helper_pidfd, fd, 0) >= 0:
+        raise AssertionError(('took a descriptor from the sandbox helper', fd))
+try:
+    open(f'/proc/{helper}/mem', 'r+b').close()
+except OSError:
+    pass
+else:
+    raise AssertionError('opened the sandbox helper memory')
+
+proxy_port = urllib.parse.urlsplit(os.environ['HTTP_PROXY']).port
+socket.create_connection(('127.0.0.1', proxy_port), timeout=2).close()
+try:
+    socket.create_connection(('192.0.2.1', 80), timeout=0.5).close()
+except OSError:
+    pass
+else:
+    raise AssertionError('direct network unexpectedly allowed')
+for family in (socket.AF_NETLINK, getattr(socket, 'AF_VSOCK', 40)):
+    try:
+        socket.socket(family, socket.SOCK_STREAM).close()
+    except OSError as error:
+        assert error.errno == errno.EPERM, (family, error)
+    else:
+        raise AssertionError(('socket family unexpectedly allowed', family))
+"#;
+    let output = run_managed_python(
+        managed_network_config(
+            /*dangerously_allow_all_unix_sockets*/ false,
+            &[&allowed, &granted_dir, &service],
+        ),
+        probe,
+        &[
+            allowed.as_os_str(),
+            unlisted.as_os_str(),
+            beneath.as_os_str(),
+            other.as_os_str(),
+            service.as_os_str(),
+            to_allowed.as_os_str(),
+            to_unlisted.as_os_str(),
+            own_dir.as_os_str(),
+        ],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().expect("service should finish");
 }
