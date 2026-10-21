@@ -166,6 +166,11 @@ jobs:
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     needs: changed
+    # Fork: this job runs Bazel through OpenAI's BuildBuddy cache on a
+    # self-hosted Windows runner and a paid macOS runner. In the fork it fails
+    # instantly or queues forever, so it is upstream-only; `results` below
+    # accepts it being skipped outside openai/codex. See docs/fork-ci.md.
+    if: ${{ github.repository == 'openai/codex' }}
     environment:
       name: bazel
       deployment: false
@@ -249,7 +254,13 @@ jobs:
           fi
 
           if [[ "${NEEDS_CHANGED_OUTPUTS_ARGUMENT_COMMENT_LINT}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then
-            [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
+            # Fork: the prebuilt lint is upstream-only (see its `if`), so a
+            # skipped result is acceptable outside openai/codex.
+            if [[ '${{ github.repository }}' == 'openai/codex' ]]; then
+              [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
+            else
+              [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' || '${{ needs.argument_comment_lint_prebuilt.result }}' == 'skipped' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
+            fi
           fi
 
           if [[ "${NEEDS_CHANGED_OUTPUTS_CODEX}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then
