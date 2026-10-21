@@ -24,6 +24,7 @@ use crate::launcher::initialize_bwrap_launcher;
 use crate::launcher::preferred_bwrap_supports_argv0;
 use crate::proxy_routing::activate_proxy_routes_in_netns;
 use crate::proxy_routing::prepare_host_proxy_route_spec;
+use crate::seccomp::UnixSocketEnforcement;
 use crate::seccomp::apply_permission_profile_to_current_thread;
 use crate::unix_socket_policy::UnixSocketPolicy;
 use crate::unix_socket_supervisor::UnixSocketSupervisor;
@@ -204,16 +205,17 @@ pub fn run_main() -> ! {
             }
         }
         let proxy_routing_active = allow_network_for_proxy;
-        let unix_socket_supervisor = managed_network
-            .as_ref()
-            .and_then(prepare_unix_socket_supervisor);
+        let (unix_socket_enforcement, unix_socket_supervisor) = managed_network.as_ref().map_or(
+            (UnixSocketEnforcement::NotEnforced, None),
+            enforce_unix_socket_allowlist,
+        );
         if let Err(e) = apply_permission_profile_to_current_thread(
             &permission_profile,
             &sandbox_policy_cwd,
             /*apply_landlock_fs*/ false,
             managed_network.as_ref(),
             proxy_routing_active,
-            /*brokered_unix_sockets*/ unix_socket_supervisor.is_some(),
+            unix_socket_enforcement,
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
@@ -268,7 +270,7 @@ pub fn run_main() -> ! {
             /*apply_landlock_fs*/ false,
             managed_network.as_ref(),
             /*proxy_routing_active*/ false,
-            /*brokered_unix_sockets*/ false,
+            UnixSocketEnforcement::NotEnforced,
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
@@ -337,7 +339,7 @@ pub fn run_main() -> ! {
         /*apply_landlock_fs*/ true,
         managed_network.as_ref(),
         /*proxy_routing_active*/ false,
-        /*brokered_unix_sockets*/ false,
+        UnixSocketEnforcement::NotEnforced,
     ) {
         panic!("error applying legacy Linux sandbox restrictions: {e:?}");
     }
@@ -373,27 +375,40 @@ fn parse_managed_network(value: &str) -> std::result::Result<ManagedNetworkSandb
         .map_err(|err| format!("invalid managed network context JSON: {err}"))
 }
 
-/// Prepares enforcement of the managed network's Unix socket allowlist.
-/// Without it, seccomp keeps refusing standalone Unix sockets, as it does when
-/// nothing is allowed.
-fn prepare_unix_socket_supervisor(
+/// Starts enforcing the managed network's Unix socket allowlist: with
+/// Landlock where the kernel supports it, else by preparing the supervisor,
+/// which the forked command then enters. Without either, seccomp keeps
+/// refusing standalone Unix sockets, as it does when nothing is allowed.
+fn enforce_unix_socket_allowlist(
     managed_network: &ManagedNetworkSandboxContext,
-) -> Option<UnixSocketSupervisor> {
+) -> (UnixSocketEnforcement, Option<UnixSocketSupervisor>) {
+    let not_enforced = (UnixSocketEnforcement::NotEnforced, None);
     if managed_network.dangerously_allow_all_unix_sockets {
-        return None;
+        return not_enforced;
     }
     let policy = UnixSocketPolicy::resolve(&managed_network.allow_unix_sockets);
     if policy.is_empty() {
-        return None;
+        return not_enforced;
     }
-    UnixSocketSupervisor::prepare(policy)
-        .inspect_err(|err| {
+    if crate::unix_socket_landlock::supported() {
+        match crate::unix_socket_landlock::restrict_current_thread(&policy) {
+            Ok(()) => return (UnixSocketEnforcement::Landlock, None),
+            // No domain was created, so the supervisor can still enforce it.
+            Err(err) => eprintln!(
+                "codex-linux-sandbox: Landlock could not enforce the Unix socket allowlist: {err}"
+            ),
+        }
+    }
+    match UnixSocketSupervisor::prepare(policy) {
+        Ok(supervisor) => (UnixSocketEnforcement::Supervisor, Some(supervisor)),
+        Err(err) => {
             eprintln!(
                 "codex-linux-sandbox: Unix socket allowlist not enforced, so standalone Unix \
                  sockets stay blocked: {err}"
             );
-        })
-        .ok()
+            not_enforced
+        }
+    }
 }
 
 fn resolve_permission_profile(
