@@ -219,6 +219,7 @@ jobs:
         run: |
           set -euo pipefail
           cp scripts/install/install-fork.sh dist/install-fork.sh
+          cp scripts/install/migrate-codex-home.sh dist/migrate-codex-home.sh
           (cd dist && sha256sum codex-package-*.tar.gz codex-package-*.tar.zst > codex-package_SHA256SUMS)
           ls -l dist
           cat dist/codex-package_SHA256SUMS
@@ -252,6 +253,7 @@ jobs:
           - \`codex-package-<target>.tar.gz\` / \`.tar.zst\`: the Codex package (bin/codex, bin/codex-code-mode-host, codex-resources/bwrap, codex-path/rg, codex-package.json)
           - \`codex-package_SHA256SUMS\`: checksums the installer verifies
           - \`install-fork.sh\`: the installer
+          - \`migrate-codex-home.sh\`: carries config.toml, auth.json and your own skills/rules from a previous Codex home (upstream, a separate CODEX_HOME, or a Windows setup moving into WSL) into this one; see \`--help\`
           EOF
           cat notes.md
 
