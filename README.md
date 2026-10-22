@@ -13,6 +13,11 @@ On Linux 7.1+ the fork uses Landlock (<code>LANDLOCK_ACCESS_FS_RESOLVE_UNIX</cod
 <strong>Installing the fork (Linux x86_64, prebuilt):</strong>
 <pre>curl -fsSL https://github.com/JSBtechnologies/codex/releases/latest/download/install-fork.sh | sh</pre>
 Fork releases are tagged <code>fork-v&lt;version&gt;</code>, the binary reports <code>&lt;version&gt;+fork</code>, and they are built by <a href=".github/workflows/fork-release.yml">.github/workflows/fork-release.yml</a> from the same package layout upstream ships (<code>codex-package-&lt;target&gt;.tar.gz</code>). The installer puts the package under <code>~/.codex/packages/standalone</code> and links <code>~/.local/bin/codex</code>. Needs glibc 2.35+ (Ubuntu 22.04+, Debian 12+, WSL2). Windows packages are the next step. To cut a release: <code>git tag fork-v0.1.0 &amp;&amp; git push origin fork-v0.1.0</code>. To build from source instead, see <a href="atrium-smoke/README.md">atrium-smoke/README.md</a>.
+<br><br>
+<strong>Coming from a previous Codex setup:</strong> the fork reads the same <code>~/.codex</code> (<code>config.toml</code>, <code>auth.json</code>, trusted folders), so on the same machine nothing needs migrating. For a separate home (<code>CODEX_HOME=~/.codex-fork</code>) or a Windows setup moving into WSL, <a href="scripts/install/migrate-codex-home.sh">scripts/install/migrate-codex-home.sh</a> (also attached to each release) copies the config, login and your own skills/rules, rewrites Windows trusted-folder keys to <code>/mnt/&lt;drive&gt;/…</code> paths, merges additively into an existing <code>config.toml</code>, and leaves machine state (packages, sqlite, caches) behind:
+<pre>curl -fsSL https://github.com/JSBtechnologies/codex/releases/latest/download/migrate-codex-home.sh -o migrate-codex-home.sh
+bash migrate-codex-home.sh --dry-run            # under WSL: finds /mnt/c/Users/&lt;you&gt;/.codex by itself
+bash migrate-codex-home.sh --from ~/.codex --to ~/.codex-fork   # explicit source and destination</pre>
 
 ## Quickstart
 
