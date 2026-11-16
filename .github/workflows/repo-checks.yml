@@ -5,7 +5,11 @@ on:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    # Fork: pinned to ubuntu-24.04. scripts/install/test_install_sh.py copies
+    # /bin/sleep under another name to fake a running helper; on newer images
+    # /bin/sleep is the uutils multi-call binary, which refuses the new name
+    # ("coreutils: unknown program 'codex-code-mode-host'").
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       NODE_OPTIONS: --max-old-space-size=4096
