@@ -22,10 +22,13 @@
 
 name: fork-release
 
+# Manual only. Releases are normally built on a developer machine with
+# scripts/fork-release-local.sh, which produces the same assets without an
+# hour of hosted-runner time. This workflow is the fallback (and the way to
+# get a glibc 2.35 build from ubuntu-22.04): dispatch it on a branch for a
+# build-only run, or on a fork-v<semver> tag to publish that release
+# (`gh workflow run fork-release.yml --ref fork-v0.2.0 -f version=0.2.0`).
 on:
-  push:
-    tags:
-      - "fork-v*"
   workflow_dispatch:
     inputs:
       version:
