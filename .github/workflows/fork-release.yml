@@ -156,12 +156,48 @@ jobs:
           (cd codex-rs && cargo update --workspace --offline 2>/dev/null || cargo update --workspace)
           echo "FORK_VERSION=${fork_version}" >> "$GITHUB_ENV"
 
+      # The package builder builds every binary in one cargo invocation, so
+      # the thin-LTO links of codex, codex-code-mode-host and codex-exec-server
+      # overlap. Since upstream added codex-exec-server to the package that
+      # starves the hosted runner ("lost communication with the server" after
+      # 70 minutes). Link them one at a time first; the builder's own cargo
+      # run is then a no-op. Resolving the V8 artifacts up front and exporting
+      # them keeps the environment identical for both, so nothing rebuilds.
+      - name: Resolve V8 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "${{ matrix.target }}" <<'PY'
+          import contextlib, os, sys
+          sys.path.insert(0, "scripts")
+          from codex_package.targets import TARGET_SPECS
+          from codex_package.v8 import resolve_codex_v8_cargo_env
+          with contextlib.redirect_stdout(sys.stderr):
+              env = resolve_codex_v8_cargo_env(TARGET_SPECS[sys.argv[1]])
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as out:
+              for key, value in env.items():
+                  out.write(f"{key}={value}\n")
+                  print(f"{key}={value}")
+          PY
+
+      - name: Prebuild binaries one at a time
+        shell: bash
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          for bin in codex codex-code-mode-host codex-exec-server bwrap; do
+            echo "::group::cargo build --bin $bin"
+            cargo build --target "${{ matrix.target }}" --profile release --bin "$bin"
+            echo "::endgroup::"
+            free -m | sed -n 2p
+          done
+
       - name: Build Codex package
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Builds codex, codex-code-mode-host and bwrap with cargo, fetches
+          # Packages the binaries prebuilt above (its cargo run is a no-op), fetches
           # the pinned ripgrep, strips the package copies and writes the
           # archives. RUSTY_V8_MIRROR/_TAG come from .cargo/config.toml.
           python3 scripts/build_codex_package.py \
@@ -185,6 +221,7 @@ jobs:
           "$pkg/bin/codex" --version | tee /dev/stderr | grep -F "${FORK_VERSION}"
           "$pkg/bin/codex" --help | grep -q -- "--trust-folder"
           test -x "$pkg/bin/codex-code-mode-host"
+          test -x "$pkg/bin/codex-exec-server"
           test -x "$pkg/codex-resources/bwrap"
           test -x "$pkg/codex-path/rg"
           # A fresh tarball must round-trip to the same layout.
