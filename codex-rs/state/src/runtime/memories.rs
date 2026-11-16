@@ -177,6 +177,7 @@ WHERE kind = ? AND job_key = ?
             r#"
 SELECT
     threads.id,
+    threads.attached_thread_parent_id,
     threads.rollout_path,
     threads.created_at_ms AS created_at,
     threads.updated_at_ms AS updated_at,
@@ -227,6 +228,7 @@ FROM threads
         push_thread_filters(
             &mut builder,
             ThreadFilterOptions {
+                included_thread_ids: None,
                 archived_only: false,
                 allowed_sources,
                 model_providers: None,
@@ -571,6 +573,7 @@ WHERE so.thread_id = ? AND so.source_updated_at = ?
             r#"
 SELECT
     threads.id,
+    threads.attached_thread_parent_id,
     threads.rollout_path,
     threads.created_at_ms AS created_at,
     threads.updated_at_ms AS updated_at,
@@ -2089,6 +2092,7 @@ mod tests {
         );
         eligible_idle.created_at = eligible_idle_at;
         eligible_idle.updated_at = eligible_idle_at;
+        eligible_idle.attached_thread_parent_id = Some(current_thread_id);
         runtime
             .upsert_thread(&eligible_idle)
             .await

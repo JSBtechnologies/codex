@@ -8,6 +8,7 @@ use codex_core::config::TokenBudgetConfig;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_login::CodexAuth;
+use codex_mcp::McpServerKey;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::items::TurnItem;
@@ -293,6 +294,7 @@ async fn token_budget_guidance_precedes_standalone_context_window(
     assert!(request.has_content_kinds(&[
         "token_budget.context_window_guidance",
         "permissions.instructions",
+        "tools.deferred_namespaces",
     ]));
     assert!(request.has_content_kinds(&["token_budget.context_window"; 3]));
     let developer_texts = request.message_input_texts("developer");
@@ -833,7 +835,7 @@ async fn token_budget_context_injects_plain_thread_hint_text(cached_subagent: bo
                 .thread
                 .mcp_connection_statuses(&mcp_config)
                 .await
-                .get("notes"),
+                .get(&McpServerKey::unscoped("notes")),
             Some(&McpServerConnectionStatus::NotStarted),
         );
         (subagent.thread, subagent.thread_id)
@@ -1694,6 +1696,8 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        catalog_deltas_enabled: config.features.enabled(Feature::SkillCatalogDeltas),
+        omit_descriptions: false,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         cloud_skill_enabled: config.cloud_skill_enabled,

@@ -12,6 +12,7 @@ use crate::http_proxy;
 use crate::network_policy::NetworkDecision;
 use crate::network_policy::NetworkDecisionSource;
 use crate::network_policy::NetworkPolicyDecider;
+use crate::remote_config::RemoteCredentialMasking;
 use crate::runtime::BlockedRequestObserver;
 use crate::runtime::ConfigState;
 use crate::runtime::HostAuthorization;
@@ -682,7 +683,10 @@ pub fn is_managed_proxy_env_var(key: &str, value: &str) -> bool {
     if PROXY_ENV_KEYS.contains(&key) {
         return true;
     }
-    if crate::certs::CUSTOM_CA_ENV_KEYS.contains(&key) {
+    if key == crate::aws_sigv4::AWS_CA_BUNDLE
+        || crate::certs::CUSTOM_CA_ENV_KEYS.contains(&key)
+        || crate::certs::CHILD_ONLY_CA_ENV_KEYS.contains(&key)
+    {
         return crate::certs::is_managed_mitm_ca_trust_bundle_path(value);
     }
     #[cfg(target_os = "macos")]
@@ -877,12 +881,44 @@ fn apply_proxy_env_overrides(
             }
             env.insert(key.to_string(), managed_path.clone());
         }
+        for key in crate::certs::CHILD_ONLY_CA_ENV_KEYS {
+            if crate::credential_broker::env_value(env, key).is_none() {
+                env.insert(key.to_string(), managed_path.clone());
+            }
+        }
     }
 }
 
 impl NetworkProxy {
     pub fn builder() -> NetworkProxyBuilder {
         NetworkProxyBuilder::default()
+    }
+
+    /// Starts a Codex-managed proxy from resolved policy. Keep the handle for as long as
+    /// clients need the proxy. A disabled policy returns the proxy and an inactive handle.
+    pub async fn start_managed(
+        state: NetworkProxyState,
+        routing: ManagedProxyRouting,
+        policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
+        blocked_request_observer: Option<Arc<dyn BlockedRequestObserver>>,
+    ) -> Result<(Self, NetworkProxyHandle)> {
+        // Startup errors can cross the executor RPC boundary. Keep the stage and immediate cause.
+        let proxy = NetworkProxyBuilder {
+            state: Some(Arc::new(state)),
+            managed_by_codex: true,
+            managed_proxy_routing: routing,
+            policy_decider,
+            blocked_request_observer,
+            ..Default::default()
+        }
+        .build()
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to build network proxy: {err}"))?;
+        let handle = proxy
+            .run()
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to run network proxy: {err}"))?;
+        Ok((proxy, handle))
     }
 
     pub fn http_addr(&self) -> SocketAddr {
@@ -949,15 +985,17 @@ impl NetworkProxy {
     pub async fn remote_launch_config(
         &self,
         local_binding_policy: crate::LocalBindingPolicy,
-        credential_masking: bool,
+        credential_masking: RemoteCredentialMasking,
     ) -> Result<crate::RemoteNetworkProxyLaunchConfig> {
         let (mut config, brokerage_created_default_allowlist, _) =
             self.state.current_cfg_with_brokerage_provenance().await?;
-        // Configured providers are not transported yet, so these commands run unmasked.
-        let credential_masking = credential_masking
-            && config.enabled
+        let credential_masking = config.enabled
             && config.credential_broker
-            && config.credential_providers.is_empty();
+            && match credential_masking {
+                RemoteCredentialMasking::Disabled => false,
+                RemoteCredentialMasking::BuiltInOnly => config.credential_providers.is_empty(),
+                RemoteCredentialMasking::WithConfiguredProviders => true,
+            };
         anyhow::ensure!(
             !credential_masking
                 || (!config.dangerously_allow_plaintext_credential_injection
@@ -1021,7 +1059,9 @@ impl NetworkProxy {
             "MXC cannot enforce allow_local_binding=false: native host-loopback access is bidirectional; use true or a different sandbox backend"
         );
         let mut proxy = crate::RemoteNetworkProxyConfig::from_effective_config(&config)?;
-        proxy.credential_masking = credential_masking;
+        if credential_masking {
+            proxy.enable_credential_masking(config.credential_providers);
+        }
         tracing::debug!(network_config = ?proxy, "resolved remote execution network configuration");
         let (environment_id, execution_id) = self
             .execution_scope
@@ -1148,7 +1188,6 @@ impl NetworkProxy {
         &self,
         mut env: HashMap<String, String>,
         addrs: EnvironmentProxyAddrs,
-        #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
         client: EnvironmentProxyClient,
         environment_id: Option<&str>,
     ) -> PreparedManagedNetwork {
@@ -1166,6 +1205,15 @@ impl NetworkProxy {
             ..addrs
         };
         let runtime_settings = self.runtime_settings();
+        if client == EnvironmentProxyClient::SandboxedProcess {
+            self.state.mask_local_aws_credentials(
+                &mut env,
+                runtime_settings
+                    .mitm_ca_trust_bundle
+                    .as_ref()
+                    .map(|bundle| bundle.path.as_path()),
+            );
+        }
         // Enforce proxying for child processes. Proxy endpoint values are always rewritten;
         // managed MITM CA vars preserve child-scoped overrides after proxy startup.
         apply_proxy_env_overrides(
@@ -1582,28 +1630,37 @@ impl NetworkProxy {
         Ok(addrs)
     }
 
-    pub async fn replace_config_state(&self, new_state: ConfigState) -> Result<()> {
-        let current_cfg = self.state.current_cfg().await?;
+    /// Verifies that an in-place reload preserves the running proxy's listeners.
+    pub fn validate_config_update(
+        current_cfg: &config::NetworkProxyConfig,
+        next: &config::NetworkProxyConfig,
+    ) -> Result<()> {
         anyhow::ensure!(
-            new_state.config.enabled == current_cfg.enabled,
+            next.enabled == current_cfg.enabled,
             "cannot update network.enabled on a running proxy"
         );
         anyhow::ensure!(
-            new_state.config.proxy_url == current_cfg.proxy_url,
+            next.proxy_url == current_cfg.proxy_url,
             "cannot update network.proxy_url on a running proxy"
         );
         anyhow::ensure!(
-            new_state.config.socks_url == current_cfg.socks_url,
+            next.socks_url == current_cfg.socks_url,
             "cannot update network.socks_url on a running proxy"
         );
         anyhow::ensure!(
-            new_state.config.enable_socks5 == current_cfg.enable_socks5,
+            next.enable_socks5 == current_cfg.enable_socks5,
             "cannot update network.enable_socks5 on a running proxy"
         );
         anyhow::ensure!(
-            new_state.config.enable_socks5_udp == current_cfg.enable_socks5_udp,
+            next.enable_socks5_udp == current_cfg.enable_socks5_udp,
             "cannot update network.enable_socks5_udp on a running proxy"
         );
+        Ok(())
+    }
+
+    pub async fn replace_config_state(&self, new_state: ConfigState) -> Result<()> {
+        let current_cfg = self.state.current_cfg().await?;
+        Self::validate_config_update(&current_cfg, &new_state.config)?;
         let config = self
             .state
             .local_binding_policy
@@ -1970,7 +2027,7 @@ mod tests {
         assert_eq!(proxy.current_cfg().await?, config);
 
         let remote = proxy
-            .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
+            .remote_launch_config(DefaultFalse, RemoteCredentialMasking::Disabled)
             .await?;
         assert_eq!(
             (
@@ -2068,7 +2125,7 @@ mod tests {
         owner_config.set_denied_domains(vec!["denied.example".to_string()]);
         assert_eq!(
             scoped
-                .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
+                .remote_launch_config(DefaultFalse, RemoteCredentialMasking::Disabled)
                 .await?
                 .proxy
                 .domains,
@@ -2471,6 +2528,14 @@ mod tests {
 
     #[tokio::test]
     async fn remote_launch_config_carries_execution_scope() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ca = crate::certs::ManagedMitmCa::for_test(dir.path())?;
+        crate::certs::TEST_MITM_CA
+            .scope(ca, check_remote_launch_config_execution_scope())
+            .await
+    }
+
+    async fn check_remote_launch_config_execution_scope() -> Result<()> {
         #[cfg(target_os = "windows")]
         let _permit = WINDOWS_INGRESS_TEST_LOCK.acquire().await.unwrap();
         let mut config = NetworkProxyConfig {
@@ -2507,7 +2572,7 @@ mod tests {
             /*fallback_policy_decider*/ None,
         )?;
         let launch = scoped
-            .remote_launch_config(RequireTrue, /*credential_masking*/ false)
+            .remote_launch_config(RequireTrue, RemoteCredentialMasking::Disabled)
             .await?;
         let prepared = scoped.prepare_for_optional_environment(
             HashMap::from([(
@@ -2522,7 +2587,7 @@ mod tests {
         assert!(!launch.proxy.enabled);
         assert!(
             scoped
-                .remote_launch_config(DefaultFalse, /*credential_masking*/ true)
+                .remote_launch_config(DefaultFalse, RemoteCredentialMasking::BuiltInOnly)
                 .await
                 .is_err()
         );
@@ -2538,15 +2603,50 @@ mod tests {
             },
         );
         let custom_provider_proxy = NetworkProxy::builder()
-            .state(Arc::new(network_proxy_state_for_policy(config)))
+            .state(Arc::new(network_proxy_state_for_policy(config.clone())))
             .build()
             .await?;
         assert_eq!(
             custom_provider_proxy
-                .remote_launch_config(DefaultFalse, /*credential_masking*/ true)
+                .remote_launch_config(DefaultFalse, RemoteCredentialMasking::BuiltInOnly)
                 .await?
                 .proxy,
             launch.proxy
+        );
+        assert!(
+            custom_provider_proxy
+                .remote_launch_config(
+                    DefaultFalse,
+                    RemoteCredentialMasking::WithConfiguredProviders
+                )
+                .await
+                .is_err()
+        );
+        config.dangerously_allow_plaintext_credential_injection = false;
+        let custom_provider_proxy = NetworkProxy::builder()
+            .state(Arc::new(network_proxy_state_for_policy(config.clone())))
+            .build()
+            .await?;
+        assert_eq!(
+            custom_provider_proxy
+                .remote_launch_config(DefaultFalse, RemoteCredentialMasking::Disabled)
+                .await?
+                .proxy,
+            launch.proxy
+        );
+        let custom_launch = custom_provider_proxy
+            .remote_launch_config(
+                DefaultFalse,
+                RemoteCredentialMasking::WithConfiguredProviders,
+            )
+            .await?;
+        assert!(custom_launch.proxy.credential_masking_enabled());
+        assert_eq!(
+            custom_launch
+                .proxy
+                .into_network_proxy_config()
+                .credential_providers,
+            config.credential_providers,
         );
 
         let mut owner_config = NetworkProxyConfig::default();
@@ -2563,7 +2663,7 @@ mod tests {
         )?;
         assert!(
             owner_scoped
-                .remote_launch_config(DefaultFalse, /*credential_masking*/ false)
+                .remote_launch_config(DefaultFalse, RemoteCredentialMasking::Disabled)
                 .await
                 .is_err()
         );
@@ -2595,13 +2695,16 @@ mod tests {
                 .state(Arc::new(network_proxy_state_for_policy(config)))
                 .build()
                 .await?;
-            for credential_masking in [false, true] {
+            for (credential_masking, expected_masking) in [
+                (RemoteCredentialMasking::Disabled, false),
+                (RemoteCredentialMasking::BuiltInOnly, true),
+            ] {
                 let launch = proxy
                     .remote_launch_config(DefaultFalse, credential_masking)
                     .await?;
                 assert!(launch.proxy.enabled);
                 assert_eq!(launch.proxy.mode, mode);
-                assert_eq!(launch.proxy.credential_masking, credential_masking);
+                assert_eq!(launch.proxy.credential_masking_enabled(), expected_masking);
             }
         }
         assert_eq!(
@@ -3015,7 +3118,11 @@ mod tests {
             Some(&mitm_ca_trust_bundle),
         );
 
-        for key in crate::certs::CUSTOM_CA_ENV_KEYS {
+        assert!(!env.contains_key("NIX_SSL_CERT_FILE"));
+        for key in crate::certs::CUSTOM_CA_ENV_KEYS
+            .into_iter()
+            .chain(["DENO_CERT", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE"])
+        {
             assert_eq!(
                 env.get(key),
                 Some(&mitm_ca_trust_bundle_path.display().to_string())
@@ -3026,10 +3133,21 @@ mod tests {
     #[test]
     fn apply_proxy_env_overrides_preserves_command_scoped_mitm_ca_override() {
         let command_ca_bundle_path = "/tmp/command-ca.pem".to_string();
-        let mut env = HashMap::from([(
-            "REQUESTS_CA_BUNDLE".to_string(),
-            command_ca_bundle_path.clone(),
-        )]);
+        let mut env = HashMap::from([
+            (
+                "REQUESTS_CA_BUNDLE".to_string(),
+                command_ca_bundle_path.clone(),
+            ),
+            (
+                "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE".to_string(),
+                command_ca_bundle_path.clone(),
+            ),
+            ("DENO_CERT".to_string(), String::new()),
+            (
+                "NIX_SSL_CERT_FILE".to_string(),
+                command_ca_bundle_path.clone(),
+            ),
+        ]);
         let mitm_ca_trust_bundle_path = Path::new("/tmp/codex-proxy/ca-bundle.pem");
         let mitm_ca_trust_bundle = crate::certs::ManagedMitmCaTrustBundle {
             path: mitm_ca_trust_bundle_path.to_path_buf(),
@@ -3045,7 +3163,14 @@ mod tests {
             Some(&mitm_ca_trust_bundle),
         );
 
-        assert_eq!(env.get("REQUESTS_CA_BUNDLE"), Some(&command_ca_bundle_path));
+        for key in [
+            "REQUESTS_CA_BUNDLE",
+            "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+            "NIX_SSL_CERT_FILE",
+        ] {
+            assert_eq!(env.get(key), Some(&command_ca_bundle_path));
+        }
+        assert_eq!(env.get("DENO_CERT").map(String::as_str), Some(""));
         assert_eq!(
             env.get("SSL_CERT_FILE"),
             Some(&mitm_ca_trust_bundle_path.display().to_string())

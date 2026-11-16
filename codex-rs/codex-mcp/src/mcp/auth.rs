@@ -8,6 +8,7 @@ use codex_config::McpServerTransportConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::HttpClient;
+use codex_login::AccountOAuthGrant;
 use codex_login::CodexAuth;
 use codex_rmcp_client::McpAuthState;
 use codex_rmcp_client::McpLoginRequirement;
@@ -21,8 +22,10 @@ use codex_rmcp_client::discover_streamable_http_oauth;
 use codex_rmcp_client::resolve_mcp_oauth_callback_url;
 use futures::FutureExt;
 use futures::future::join_all;
+use tokio::sync::OnceCell;
 use tracing::warn;
 
+use crate::McpServerKey;
 use crate::runtime::McpRuntimeContext;
 use crate::server::EffectiveMcpServer;
 use crate::server::has_explicit_http_authorization;
@@ -200,12 +203,17 @@ pub async fn compute_auth_statuses<'a, I>(
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     auth: Option<&CodexAuth>,
+    auth_manager: Option<&std::sync::Arc<codex_login::AuthManager>>,
+    ema_state: &crate::EmaState,
     runtime_context: &McpRuntimeContext,
-) -> HashMap<String, McpAuthStatusEntry>
+) -> HashMap<McpServerKey, McpAuthStatusEntry>
 where
-    I: IntoIterator<Item = (&'a String, &'a EffectiveMcpServer)>,
+    I: IntoIterator<Item = (&'a McpServerKey, &'a EffectiveMcpServer)>,
 {
+    // Share successful, missing, and failed reads without starting storage work for non-EMA servers.
+    let account_grant = OnceCell::new();
     let futures = servers.into_iter().map(|(name, server)| {
+        let account_grant = &account_grant;
         let name = name.clone();
         let redirect_mode = if server.is_agent_plugin() {
             StreamableHttpRedirectMode::AgentPluginV1
@@ -216,11 +224,14 @@ where
         let runtime_context = runtime_context.clone();
         async move {
             let auth_state = match compute_auth_status(
-                &name,
+                name.name(),
                 &config,
                 store_mode,
                 keyring_backend_kind,
                 auth,
+                auth_manager,
+                account_grant,
+                ema_state,
                 &runtime_context,
                 redirect_mode,
             )
@@ -243,12 +254,16 @@ where
     join_all(futures).await.into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compute_auth_status(
     server_name: &str,
     config: &McpServerConfig,
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     auth: Option<&CodexAuth>,
+    auth_manager: Option<&std::sync::Arc<codex_login::AuthManager>>,
+    account_grant: &OnceCell<std::io::Result<Option<AccountOAuthGrant>>>,
+    ema_state: &crate::EmaState,
     runtime_context: &McpRuntimeContext,
     redirect_mode: StreamableHttpRedirectMode,
 ) -> Result<McpAuthState> {
@@ -265,21 +280,54 @@ async fn compute_auth_status(
         let Some(scope) = crate::ema_auth_scope(auth) else {
             return Ok(McpAuthState::LoggedOut(McpLoginRequirement::Login));
         };
+        if matches!(auth, Some(CodexAuth::Chatgpt(_)))
+            && auth
+                .and_then(|auth| auth.get_token_data().ok())
+                .is_none_or(|tokens| tokens.login_owner_id.as_ref().is_none_or(String::is_empty))
+        {
+            return Ok(McpAuthState::LoggedOut(McpLoginRequirement::Login));
+        }
+        let account_usable = match auth_manager {
+            Some(manager) => match account_grant
+                .get_or_init(|| manager.account_oauth_grant())
+                .await
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+            {
+                Some(grant) => {
+                    crate::ema_account::account_grant_is_usable(grant.tokens(), registration.idp())
+                        && !ema_state.requires_sign_in(registration, grant.tokens())
+                }
+                None => false,
+            },
+            None => auth.is_some_and(|auth| ema_state.account_is_usable(auth, registration)),
+        };
+        if account_usable {
+            return Ok(McpAuthState::BearerToken);
+        }
         return Ok(
-            if crate::ema_auth::stored_ema_credentials(
+            match crate::ema_auth::stored_ema_credentials(
                 registration.idp(),
                 &scope,
                 keyring_backend_kind,
             )
             .await?
-            .is_some()
             {
-                McpAuthState::OAuth
-            } else {
-                McpAuthState::LoggedOut(McpLoginRequirement::Login)
+                Some(snapshot)
+                    if codex_rmcp_client::stored_ema_identity_is_usable(
+                        snapshot.credentials(),
+                        &registration.idp().issuer,
+                        &registration.idp().client_id,
+                    ) =>
+                {
+                    McpAuthState::OAuth
+                }
+                Some(_) => McpAuthState::LoggedOut(McpLoginRequirement::Reauthentication),
+                None => McpAuthState::LoggedOut(McpLoginRequirement::Login),
             },
         );
     }
+
     let has_runtime_auth = matches!(config.auth, McpServerAuth::ChatGpt)
         && auth.is_some_and(CodexAuth::uses_codex_backend)
         && matches!(

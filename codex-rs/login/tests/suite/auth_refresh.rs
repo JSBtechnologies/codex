@@ -281,6 +281,14 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
             .unwrap_or_default()
             .is_empty()
     );
+    // Inspection must complete even with an IdP lease held and a refresh queued.
+    // Unlike inspection, the exchange above must still exclude refresh.
+    let inspected = ctx
+        .auth_manager
+        .account_oauth_grant()
+        .await?
+        .context("account inspection during refresh exclusion")?;
+    assert_eq!(inspected.tokens(), &initial_tokens);
     // No await between clearing the flag and release: this wake must come from the lease.
     refresh_wake.0.store(false, Ordering::SeqCst);
     let grant = lease.release();
@@ -288,12 +296,12 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
         refresh_wake.0.load(Ordering::SeqCst),
         "releasing the account grant must wake the blocked refresh"
     );
-    assert!(grant.check_current().await?);
+    assert!(grant.current_tokens().await?.is_some());
     refresh
         .await
         .context("refresh should succeed once the IdP lease is released")?;
     assert!(
-        !grant.check_current().await?,
+        grant.current_tokens().await?.is_none(),
         "the old credential was rotated"
     );
     let after = *changes.borrow();
@@ -345,6 +353,32 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
         .context("rotated account grant")?;
     assert_eq!(lease.tokens(), &refreshed_tokens);
     let grant = lease.release();
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access-only-refresh",
+            "id_token": jwt_with_payload(json!({
+                "sub": "user-123", "iat": 42,
+                "https://api.openai.com/auth": { "chatgpt_user_id": "user-123", "chatgpt_account_id": "account-id" }
+            })),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ctx.auth_manager.refresh_token_from_authority().await?;
+    let current = ctx
+        .auth_manager
+        .lease_account_oauth_grant()
+        .await?
+        .context("same refresh grant")?
+        .release();
+    assert!(grant.same_credential(&current));
+    assert_eq!(
+        grant.current_tokens().await?,
+        Some(current.tokens().clone())
+    );
     let mut replacement = stored.clone();
     replacement
         .tokens
@@ -358,7 +392,8 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
     )?;
-    assert!(!grant.check_current().await?);
+    assert!(grant.current_tokens().await?.is_none());
+    assert!(ctx.auth_manager.account_oauth_grant().await?.is_none());
     assert!(
         !ctx.auth_manager
             .account_login_is_current(&cached_auth)
@@ -369,7 +404,7 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
             .auth_cached()
             .context("original cached auth")?
             .get_token_data()?,
-        cached,
+        current.tokens().clone(),
     );
     ctx.auth_manager.reload().await;
     assert!(
@@ -406,7 +441,7 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
     assert_eq!(after.owner_generation, before.owner_generation);
     assert!(policy.acquire(&endpoint).is_ok());
     assert_eq!(after.login_generation, before.login_generation + 1);
-    assert!(!grant.check_current().await?);
+    assert!(grant.current_tokens().await?.is_none());
     assert!(
         ctx.auth_manager
             .lease_account_oauth_grant()
@@ -420,7 +455,7 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
         changes.borrow().login_generation,
         before.login_generation + 2
     );
-    assert!(!grant.check_current().await?);
+    assert!(grant.current_tokens().await?.is_none());
     server.verify().await;
     server.reset().await;
     for login_owner_id in [Some("login-during-refresh"), None] {
@@ -484,7 +519,7 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
             latest_login.last_refresh = stored.last_refresh;
         }
         assert_eq!(stored, latest_login);
-        assert!(!grant.check_current().await?);
+        assert!(grant.current_tokens().await?.is_none());
         ctx.auth_manager.reload().await;
         assert_eq!(
             ctx.auth_manager
@@ -504,7 +539,7 @@ async fn account_grant_tracks_refresh_replacement_and_logout() -> Result<()> {
         .context("restored login grant")?;
     // Logout must complete even while an IdP exchange holds the refresh lease.
     ctx.auth_manager.logout().await?;
-    assert!(!lease.release().check_current().await?);
+    assert!(lease.release().current_tokens().await?.is_none());
     assert!(
         ctx.auth_manager
             .lease_account_oauth_grant()
@@ -1673,6 +1708,23 @@ async fn unauthorized_recovery_reloads_then_refreshes_tokens() -> Result<()> {
 
     let mut recovery = ctx.auth_manager.unauthorized_recovery();
     assert!(recovery.has_next());
+
+    std::fs::write(ctx.codex_home.path().join("auth.json"), "")?;
+    let error = recovery.next().await.expect_err("auth read should fail");
+    assert!(matches!(error, RefreshTokenError::Transient(_)));
+    assert_eq!(
+        ctx.auth_manager
+            .auth_cached()
+            .expect("read failure must preserve cached auth")
+            .get_token_data()?,
+        initial_tokens
+    );
+    save_auth(
+        ctx.codex_home.path(),
+        &disk_auth,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?;
 
     recovery.next().await?;
 

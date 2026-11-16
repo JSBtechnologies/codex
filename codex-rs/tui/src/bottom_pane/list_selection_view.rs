@@ -661,7 +661,7 @@ impl ListSelectionView {
         limit.min(len.max(/*other*/ 1))
     }
 
-    fn selected_actual_idx(&self) -> Option<usize> {
+    pub(crate) fn selected_actual_idx(&self) -> Option<usize> {
         self.state
             .selected_idx
             .and_then(|visible_idx| self.filtered_indices.get(visible_idx).copied())
@@ -812,11 +812,11 @@ impl ListSelectionView {
                             .auto_number_shortcuts
                             .then_some(item.display_shortcut)
                             .flatten(),
-                        match_indices: None,
                         description,
                         wrap_indent,
                         is_disabled,
                         disabled_reason: item.disabled_reason.clone(),
+                        ..Default::default()
                     }
                 })
             })

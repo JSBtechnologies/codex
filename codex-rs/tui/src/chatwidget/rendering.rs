@@ -1,8 +1,10 @@
 //! Shared composer and live-history composition for inline and owned transcript surfaces.
 
+use super::provider_error::ProviderErrorNotice;
 use super::transcript::ActiveCellLayoutCache;
 use super::transcript::ActiveCellLayoutCacheKey;
 use super::*;
+use crate::keymap::KeymapContext;
 use crate::render::RectExt;
 use crate::terminal_hyperlinks::HyperlinkParagraph;
 use crate::wrapping::RtOptions;
@@ -12,13 +14,13 @@ use ratatui::text::Span;
 use ratatui::widgets::Block;
 use std::cell::Cell;
 
-struct ExternalWriterNotice {
-    command_center_available: bool,
+struct ReadOnlyThreadNotice {
+    reason: ReadOnlyThread,
     agents_navigation_key_available: bool,
     transcript_hint: Option<crate::key_hint::ShortcutHint>,
 }
 
-impl Renderable for ExternalWriterNotice {
+impl Renderable for ReadOnlyThreadNotice {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let content_width = area.width.saturating_sub(/*rhs*/ 4);
         let card_lines = self.card_lines(content_width);
@@ -56,17 +58,19 @@ impl Renderable for ExternalWriterNotice {
     }
 }
 
-impl ExternalWriterNotice {
+impl ReadOnlyThreadNotice {
     fn card_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let title: Line<'static> = vec![
-            "🔒".into(),
-            "  ".into(),
-            "This conversation is open in another app".bold(),
-        ]
-        .into();
+        let (prefix, title, indent) = match self.reason {
+            ReadOnlyThread::ExternalWriter => {
+                ("🔒  ", "This conversation is open in another app", "    ")
+            }
+            ReadOnlyThread::Archived => ("", "This thread was archived", ""),
+        };
+        let title: Line<'static> = vec![prefix.into(), title.bold()].into();
+        let (key, action) = self.reason.action();
         let retry: Line<'static> = vec![
-            Span::styled("r", crate::style::accent_style()),
-            " to retry".into(),
+            Span::styled(key, crate::style::accent_style()),
+            format!(" to {action}").into(),
         ]
         .into();
         let mut lines = word_wrap_lines(&[title], usize::from(width));
@@ -78,37 +82,32 @@ impl ExternalWriterNotice {
             lines.push(retry);
         }
         lines.extend(word_wrap_lines(
-            &[Line::from(
-                "Close it there and press R to continue here.".dim(),
-            )],
+            &[Line::from(self.reason.message().dim())],
             RtOptions::new(usize::from(width))
-                .initial_indent("    ".into())
-                .subsequent_indent("    ".into()),
+                .initial_indent(indent.into())
+                .subsequent_indent(indent.into()),
         ));
         lines
     }
 
     fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut items = vec![
-            ("r".to_string(), "retry".to_string()),
-            ("f".to_string(), "fork".to_string()),
-        ];
+        let (key, action) = self.reason.action();
+        let mut items = vec![(key.to_string(), action.to_string())];
+        if self.reason == ReadOnlyThread::ExternalWriter {
+            items.push(("f".to_string(), "fork".to_string()));
+        }
         let escape = crate::key_hint::plain(KeyCode::Esc).display_label();
-        let mut quit_keys = vec![
+        let quit_keys = [
             crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
             crate::key_hint::plain(KeyCode::Char('q')).display_label(),
         ];
-        if self.command_center_available {
-            let key = if self.agents_navigation_key_available {
-                let left = crate::key_hint::plain(KeyCode::Left).display_label();
-                format!("{left}/{escape}")
-            } else {
-                escape
-            };
-            items.push((key, "command center".to_string()));
+        let key = if self.agents_navigation_key_available {
+            let left = crate::key_hint::plain(KeyCode::Left).display_label();
+            format!("{left}/{escape}")
         } else {
-            quit_keys.insert(/*index*/ 0, escape);
-        }
+            escape
+        };
+        items.push((key, "command center".to_string()));
         items.push((quit_keys.join("/"), "exit".to_string()));
         if let Some(hint) = self.transcript_hint {
             items.push((hint.display_label(), "transcript".to_string()));
@@ -126,6 +125,20 @@ impl ExternalWriterNotice {
 }
 
 impl ChatWidget {
+    pub(crate) fn prepare_composer_images(&mut self, protocol: Option<crate::pets::ImageProtocol>) {
+        self.composer_images = protocol
+            .filter(|_| {
+                !self.bottom_pane.composer_local_images().is_empty()
+                    && self.no_modal_or_popup_active()
+            })
+            .and_then(|protocol| {
+                crate::transcript_image::composer::ComposerImages::for_terminal(
+                    protocol,
+                    self.composer_images.take(),
+                )
+            });
+    }
+
     pub(crate) fn as_renderable(&self) -> RenderableItem<'_> {
         let backdrop = self.as_backdrop_renderable();
         match self.centered_dialog() {
@@ -236,9 +249,33 @@ impl ChatWidget {
                     /*top*/ 1, /*left*/ 2, /*bottom*/ 1, /*right*/ 2,
                 )),
             ))
-        } else if self.external_writer_view && !self.bottom_pane.has_active_view() {
-            RenderableItem::Owned(Box::new(ExternalWriterNotice {
-                command_center_available: self.remote_connection.is_some(),
+        } else if let Some(error) = &self.provider_error
+            && !self.bottom_pane.has_active_view()
+        {
+            let can_continue = self.thread_id.is_some() && self.current_rollout_path.is_some();
+            RenderableItem::Owned(Box::new(ProviderErrorNotice {
+                title: if can_continue
+                    && matches!(
+                        error,
+                        codex_app_server_protocol::ModelProviderError::ModelProviderMismatch { .. }
+                    ) {
+                    "Continue in a new chat"
+                } else {
+                    error.title()
+                },
+                message: self.provider_error_message(error),
+                can_continue,
+                configuration_location: self
+                    .remote_connection
+                    .as_ref()
+                    .filter(|remote| !remote.is_local_daemon)
+                    .map(|remote| format!("Configuration on {}", remote.address)),
+            }))
+        } else if let Some(reason) = self.read_only_thread
+            && !self.bottom_pane.has_active_view()
+        {
+            RenderableItem::Owned(Box::new(ReadOnlyThreadNotice {
+                reason,
                 agents_navigation_key_available: self.agents_navigation_key_available(),
                 transcript_hint: self.bottom_pane.transcript_shortcut_hint(),
             }))
@@ -253,19 +290,26 @@ impl ChatWidget {
                 self.ambient_pet_wrap_reserved_cols()
             };
             options.rendered_selection = Some(&self.rendered_selection);
+            options.image_previews = self.composer_images.as_ref();
             options.warning_count = self.warning_display_state.count;
             options.textarea_right_reserve = right_reserve;
             options.separate_status_line = options.command_popup_placement
                 != crate::bottom_pane::CommandPopupPlacement::AboveComposer;
             let bottom_pane = self.bottom_pane.backdrop_with_options(options);
-            if !self.quick_dial_menu {
+            let above_composer = if self.quick_dial_menu && !options.floating_shortcuts {
+                RenderableItem::Owned(Box::new(self.quick_dial_hud()))
+            } else if let Some(backend) = self.visible_new_backend_control() {
+                let mut spans = vec!["  ".into(), backend.into()];
+                let keymap = self.bottom_pane.keymap();
+                if let Some(key) = keymap.primary_hint(KeymapContext::Global, "change_host") {
+                    spans.extend(["  ".into(), key.into(), " to cycle".dim()]);
+                }
+                RenderableItem::Owned(Box::new(Paragraph::new(Line::from(spans))))
+            } else {
                 return bottom_pane;
-            }
+            };
             let mut column = FlexRenderable::new();
-            column.push(
-                /*flex*/ 1,
-                RenderableItem::Owned(Box::new(self.quick_dial_hud())),
-            );
+            column.push(/*flex*/ 1, above_composer);
             column.push(/*flex*/ 0, bottom_pane);
             RenderableItem::Owned(Box::new(column))
         }

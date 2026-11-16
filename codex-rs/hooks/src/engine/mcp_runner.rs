@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_protocol::mcp::is_node_repl_backed_server;
 use codex_protocol::models::ContentItemMetadata;
 use regex::Regex;
 use serde_json::Map;
@@ -32,7 +33,7 @@ pub(crate) async fn run_mcp_tool(
     server: &str,
     tool: &str,
     argument_template: &Map<String, Value>,
-    hook_event_json: &str,
+    hook_event: &Value,
     metadata: Option<&Map<String, Value>>,
 ) -> HandlerRunResult {
     let started_at = chrono::Utc::now().timestamp();
@@ -45,11 +46,12 @@ pub(crate) async fn run_mcp_tool(
                 .await
                 .context("hook trust verification timed out")??;
         }
-        let hook_event: Value =
-            serde_json::from_str(hook_event_json).context("failed to parse hook event input")?;
-        let input = expand_mcp_argument_template(argument_template, &hook_event)?;
+        let input = expand_mcp_argument_template(argument_template, hook_event)?;
         let (environment_id, mut call_metadata) = match &handler.source_path {
             HandlerSourcePath::Local(_) => (None, None),
+            HandlerSourcePath::Environment { environment_id, .. } => {
+                (Some(environment_id.clone()), None)
+            }
             HandlerSourcePath::ExecutorScoped {
                 environment_id,
                 mcp_environment_id,
@@ -72,6 +74,9 @@ pub(crate) async fn run_mcp_tool(
         }
         executor
             .execute(HookMcpCall {
+                skip_dormant_repl_cleanup: handler.builtin
+                    && is_node_repl_backed_server(server)
+                    && tool == "turn_ended",
                 server: server.to_string(),
                 tool: tool.to_string(),
                 environment_id,
@@ -87,11 +92,18 @@ pub(crate) async fn run_mcp_tool(
     }
     .await;
 
-    let (exit_code, stdout, error, source_tool_namespace) = match result {
-        Ok(output) => (Some(0), output.text, None, output.source_tool_namespace),
-        Err(error) => (None, String::new(), Some(error.to_string()), None),
+    let (exit_code, stdout, error, source_tool_namespace, structured_content) = match result {
+        Ok(output) => (
+            Some(0),
+            output.text,
+            None,
+            output.source_tool_namespace,
+            output.structured_content,
+        ),
+        Err(error) => (None, String::new(), Some(error.to_string()), None, None),
     };
     HandlerRunResult {
+        structured_content,
         context_metadata: ContentItemMetadata::tool(source_tool_namespace.map(Into::into)),
         started_at,
         completed_at: chrono::Utc::now().timestamp(),

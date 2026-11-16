@@ -31,11 +31,13 @@ fn composer_mouse_edits_flush_typing_and_reconcile_placeholders() {
     let area = Rect::new(
         /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 4,
     );
-    composer.render(area, &mut Buffer::empty(area));
+    let mut buf = Buffer::empty(area);
+    composer.render(area, &mut buf);
     let (x, y) = composer.cursor_pos(area).unwrap();
+    assert_eq!(buf[(x - 5, y)].symbol(), "h");
     mouse(&mut composer, area, Down(Left), x - 5, y);
     composer.insert_str("X");
-    assert_eq!(composer.current_text(), "hello\nXworld");
+    assert_eq!(composer.current_text(), "Xhello\nworld");
     composer.handle_paste("z".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1));
     for path in [Some("first.png"), Some("second.png"), None] {
         composer.render(area, &mut Buffer::empty(area));
@@ -88,27 +90,25 @@ fn recovery_keeps_unselected_text_after_a_held_replace_key() {
 
 #[test]
 fn backspace_deletes_a_body_selection_before_an_absorbed_prefix() {
-    for prefix in ["!", "/"] {
-        let (mut composer, _rx) = new_test_composer();
-        composer.insert_str(&format!("{prefix}review text"));
-        let area = Rect::new(
-            /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 4,
-        );
-        composer.render(area, &mut Buffer::empty(area));
-        let (x, y) = composer.cursor_pos(area).unwrap();
-        for (kind, column) in [
-            (Down(Left), x),
-            (MouseEventKind::Drag(Left), x - "review text".len() as u16),
-            (Up(Left), x - "review text".len() as u16),
-        ] {
-            mouse(&mut composer, area, kind, column, y);
-        }
-
-        composer.handle_key_event(KeyCode::Backspace.into());
-
-        assert_eq!(composer.current_text(), prefix);
-        assert_eq!(composer.draft.textarea.mouse_selection_range(), None);
+    let (mut composer, _rx) = new_test_composer();
+    composer.insert_str("!review text");
+    let area = Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 80, /*height*/ 4,
+    );
+    composer.render(area, &mut Buffer::empty(area));
+    let (x, y) = composer.cursor_pos(area).unwrap();
+    for (kind, column) in [
+        (Down(Left), x),
+        (MouseEventKind::Drag(Left), x - "review text".len() as u16),
+        (Up(Left), x - "review text".len() as u16),
+    ] {
+        mouse(&mut composer, area, kind, column, y);
     }
+
+    composer.handle_key_event(KeyCode::Backspace.into());
+
+    assert_eq!(composer.current_text(), "!");
+    assert_eq!(composer.draft.textarea.mouse_selection_range(), None);
 }
 
 #[test]

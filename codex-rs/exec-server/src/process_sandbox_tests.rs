@@ -500,6 +500,26 @@ async fn native_request_preserves_native_launch_fields() {
     assert_eq!(prepared.cwd, cwd);
     assert_eq!(prepared.env, env);
     assert_eq!(prepared.arg0, params.arg0);
+
+    let mut legacy = params;
+    legacy.enforce_managed_network = true;
+    let mut runtime = ExecServerRuntimeOptions::new(
+        std::env::current_exe().unwrap(),
+        /*codex_linux_sandbox_exe*/ None,
+    )
+    .unwrap();
+    runtime.tcp_upstream_proxy = Some("127.0.0.1:8088".parse().unwrap());
+    let error = prepare_exec_request(
+        &legacy,
+        env,
+        Some(&runtime),
+        /*network_policy_decider*/ None,
+        /*network_policy_audit_observer*/ None,
+    )
+    .await
+    .err()
+    .expect("legacy enforcement must require the mandatory upstream");
+    assert!(error.message.contains("executor-local managed proxy"));
 }
 
 #[test_case(false, None, &["-c", "true"]; "unmasked")]
@@ -523,7 +543,9 @@ async fn native_request_handles_remote_proxy_config_for_platform(
     config.set_allowed_domains(vec!["allowed.example".to_string()]);
     let mut proxy_config = RemoteNetworkProxyConfig::from_effective_config(&config)
         .expect("supported remote proxy config");
-    proxy_config.credential_masking = credential_masking;
+    if credential_masking {
+        proxy_config.enable_credential_masking(Default::default());
+    }
     let params = ExecParams {
         metadata: Default::default(),
         process_id: ProcessId::from("process-remote-proxy"),
@@ -627,7 +649,7 @@ async fn disabled_remote_proxy_config_is_rejected_before_exporting_ports() {
     let mut proxy_config =
         RemoteNetworkProxyConfig::from_effective_config(&NetworkProxyConfig::default())
             .expect("serializable disabled proxy config");
-    proxy_config.credential_masking = true;
+    proxy_config.enable_credential_masking(Default::default());
     let params = ExecParams {
         metadata: Default::default(),
         process_id: ProcessId::from("process-disabled-remote-proxy"),

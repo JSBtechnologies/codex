@@ -2,6 +2,7 @@
 //! A session is reusable only after its submitted turn has completed or drained.
 //! Interrupted turns roll back admitted context; completed inference errors can retain it.
 
+use crate::ReviewDeadline;
 use std::future::Future;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use codex_protocol::turn_input::TurnInputSubmission;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::GuardianReviewResponse;
 use crate::GuardianReviewSessionOutcome;
 use crate::SessionDisposition;
 
@@ -38,7 +40,7 @@ pub trait ReviewerRuntime: Sync {
 pub async fn start_review_turn(
     runtime: &impl ReviewerRuntime,
     request: TurnInputRequest,
-    deadline: Instant,
+    deadline: ReviewDeadline,
     external_cancel: Option<&CancellationToken>,
 ) -> Result<String, GuardianReviewSessionOutcome> {
     match crate::run_before_review_deadline(deadline, external_cancel, runtime.submit_turn(request))
@@ -67,11 +69,11 @@ pub struct ReviewTurnResult {
 pub async fn wait_for_guardian_review(
     runtime: &impl ReviewerRuntime,
     expected_turn_id: &str,
-    deadline: tokio::time::Instant,
+    deadline: ReviewDeadline,
     external_cancel: Option<&CancellationToken>,
     analytics_result: &mut GuardianReviewAnalyticsResult,
 ) -> ReviewTurnResult {
-    let timeout = tokio::time::sleep_until(deadline);
+    let timeout = deadline.wait();
     tokio::pin!(timeout);
     let mut last_error: Option<ErrorEvent> = None;
 
@@ -132,7 +134,9 @@ pub async fn wait_for_guardian_review(
                                 };
                             }
                             return ReviewTurnResult {
-                                outcome: GuardianReviewSessionOutcome::Completed(Ok(turn_complete.last_agent_message)),
+                                outcome: GuardianReviewSessionOutcome::Completed(Ok(
+                                    turn_complete.last_agent_message.map(GuardianReviewResponse::new),
+                                )),
                                 disposition: SessionDisposition::Reusable,
                                 turn_completed: true,
                             };

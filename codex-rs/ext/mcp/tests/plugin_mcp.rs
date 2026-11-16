@@ -303,7 +303,7 @@ async fn selected_root_ownership_retries_errors_and_caches_success() -> TestResu
 
     for (phase, enabled_root, expected) in [
         (0, None, vec![("standalone", vec![])]),
-        (1, None, vec![]),
+        (1, None, vec![("standalone", vec![])]),
         (2, Some("owned-subfolder"), vec![("selected-root", vec![])]),
         (
             3,
@@ -350,8 +350,8 @@ async fn selected_root_ownership_retries_errors_and_caches_success() -> TestResu
             .fallback_cwd(Some(codex_home.path().to_path_buf()))
             .build()
             .await?;
-        // A warning requires metadata probing, which the test filesystem cannot sandbox.
-        // Complete discovery retries ownership under the same sandbox, root, and policy.
+        // Neither incomplete nor legacy complete discovery proves that a marker is absent.
+        // The scoped metadata probe fails here; later readable roots must retry ownership.
         let discovery = (phase < 2).then(|| {
             ExecutorCapabilityDiscoverySnapshot::new(
                 std::slice::from_ref(standalone),
@@ -768,6 +768,7 @@ async fn run_cloud_plugin_projection_scenarios() -> anyhow::Result<()> {
                         locations: vec![PluginSourceLocation::Cloud {
                             resource_uri: "plugin://plugin_notes".into(),
                             bundle_uri: None,
+                            release_id: None,
                         }],
                     }],
                     ..Default::default()
@@ -824,6 +825,7 @@ async fn run_cloud_plugin_projection_scenarios() -> anyhow::Result<()> {
                 .environment_ready(
                     &selection,
                     EnvironmentConfig {
+                        environment_hooks: Default::default(),
                         allow_login_shell: false,
                         workspace_roots: selection.workspace_roots.clone(),
                         permission_profile: PermissionProfileSnapshot::legacy(
@@ -908,6 +910,7 @@ async fn run_cloud_plugin_projection_scenarios() -> anyhow::Result<()> {
             initialized, installed,
             "{case}: cloud-only declarations must not start MCPs"
         );
+        // Failed discovery stays in cooldown across both model steps.
         assert_eq!(
             cloud.calls.load(Ordering::SeqCst),
             usize::from(cloud_enabled),

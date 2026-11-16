@@ -7,6 +7,7 @@ use codex_core::context::UserGoalUpdate;
 use codex_protocol::AgentPath;
 use codex_protocol::approvals::GuardianAssessmentStatus;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -31,11 +32,14 @@ enum ReviewInterruption {
     Timeout,
 }
 
-#[test_case(ReviewInterruption::Cancellation; "cancellation")]
-#[test_case(ReviewInterruption::Timeout; "timeout")]
+#[test_case(ReviewInterruption::Cancellation, None; "cancellation")]
+#[test_case(ReviewInterruption::Cancellation, Some(0); "unlimited_cancellation")]
+#[test_case(ReviewInterruption::Timeout, None; "timeout")]
+#[test_case(ReviewInterruption::Timeout, Some(180_000); "configured_timeout")]
 #[tokio::test]
 async fn interrupted_guardian_review_preserves_evidence_once(
     interruption: ReviewInterruption,
+    timeout_ms: Option<u32>,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
@@ -93,14 +97,37 @@ async fn interrupted_guardian_review_preserves_evidence_once(
     let server = start_mock_server().await;
     let base_url = format!("{}/v1", model.uri());
     let test = test_codex()
+        .with_pre_build_hook(move |home| {
+            if let Some(timeout_ms) = timeout_ms {
+                std::fs::write(
+                    home.join("config.toml"),
+                    format!("[auto_review]\ntimeout_ms = {timeout_ms}\n"),
+                )
+                .expect("write timeout config");
+            }
+        })
         .with_config(move |config| {
             config.model_provider.base_url = Some(base_url);
-            config.model_provider.stream_idle_timeout_ms = Some(180_000);
+            config.model_provider.stream_idle_timeout_ms = Some(600_000);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config.workspace_roots_explicit = false;
+            let permission_profile = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+                &SandboxPolicy::new_workspace_write_policy(),
+                config.cwd.as_path(),
+            );
             config
-                .set_legacy_sandbox_policy(SandboxPolicy::new_workspace_write_policy())
-                .expect("set sandbox policy");
+                .permissions
+                .can_set_permission_profile(&permission_profile)
+                .expect("set permission profile");
+            config
+                .permissions
+                .set_workspace_roots(vec![config.cwd.clone()]);
+            config
+                .permissions
+                .set_permission_profile(permission_profile)
+                .expect("set permission profile");
+            config.workspace_roots = config.permissions.workspace_roots().to_vec();
         })
         .build_with_auto_env(&server)
         .await?;
@@ -136,12 +163,20 @@ async fn interrupted_guardian_review_preserves_evidence_once(
     .context("wait for pending Guardian review")?;
     match interruption {
         ReviewInterruption::Cancellation => {
+            if timeout_ms == Some(0) {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(120)).await;
+                tokio::time::resume();
+            }
             test.codex.submit(Op::Interrupt).await?;
         }
         ReviewInterruption::Timeout => {
             tokio::time::pause();
-            tokio::time::advance(codex_guardian_reviewer::REVIEW_TIMEOUT + Duration::from_secs(1))
-                .await;
+            tokio::time::advance(
+                Duration::from_millis(u64::from(timeout_ms.unwrap_or(90_000)))
+                    + Duration::from_secs(1),
+            )
+            .await;
             tokio::time::resume();
         }
     }
@@ -230,9 +265,23 @@ async fn guardian_retry_executes_only_after_a_completed_approval() -> Result<()>
     let mut builder = test_codex().with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        config.workspace_roots_explicit = false;
+        let permission_profile = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+            &SandboxPolicy::new_workspace_write_policy(),
+            config.cwd.as_path(),
+        );
         config
-            .set_legacy_sandbox_policy(SandboxPolicy::new_workspace_write_policy())
-            .expect("set sandbox policy");
+            .permissions
+            .can_set_permission_profile(&permission_profile)
+            .expect("set permission profile");
+        config
+            .permissions
+            .set_workspace_roots(vec![config.cwd.clone()]);
+        config
+            .permissions
+            .set_permission_profile(permission_profile)
+            .expect("set permission profile");
+        config.workspace_roots = config.permissions.workspace_roots().to_vec();
     });
     let test = builder.build_with_auto_env(&server).await?;
     let responses = vec![
@@ -288,9 +337,13 @@ async fn guardian_retry_executes_only_after_a_completed_approval() -> Result<()>
         .await?;
     let mut reviews = Vec::new();
     let mut warnings = Vec::new();
+    let mut command_started_at_ms = None;
     loop {
         match test.codex.next_event().await?.msg {
-            EventMsg::GuardianAssessment(review) => reviews.push(review.status),
+            EventMsg::GuardianAssessment(review) => reviews.push(review),
+            EventMsg::ItemCompleted(event) if event.item.id() == "write-marker" => {
+                command_started_at_ms = event.started_at_ms;
+            }
             EventMsg::GuardianWarning(warning) => warnings.push(warning.message),
             EventMsg::TurnComplete(_) => break,
             _ => {}
@@ -318,12 +371,16 @@ async fn guardian_retry_executes_only_after_a_completed_approval() -> Result<()>
         assert_eq!(request.inputs_of_type("agent_message"), expected_messages);
     }
     assert_eq!(
-        reviews,
+        reviews
+            .iter()
+            .map(|review| review.status)
+            .collect::<Vec<_>>(),
         vec![
             GuardianAssessmentStatus::InProgress,
             GuardianAssessmentStatus::Approved,
         ]
     );
+    assert_eq!(command_started_at_ms, Some(reviews[0].started_at_ms));
     assert_eq!(
         warnings.len(),
         1,
@@ -417,9 +474,23 @@ async fn guardian_stale_approval_replaces_review_and_preserves_earlier_context()
             config.model_provider.base_url = Some(base_url);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config.workspace_roots_explicit = false;
+            let permission_profile = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
+                &SandboxPolicy::new_workspace_write_policy(),
+                config.cwd.as_path(),
+            );
             config
-                .set_legacy_sandbox_policy(SandboxPolicy::new_workspace_write_policy())
-                .expect("sandbox policy");
+                .permissions
+                .can_set_permission_profile(&permission_profile)
+                .expect("set permission profile");
+            config
+                .permissions
+                .set_workspace_roots(vec![config.cwd.clone()]);
+            config
+                .permissions
+                .set_permission_profile(permission_profile)
+                .expect("set permission profile");
+            config.workspace_roots = config.permissions.workspace_roots().to_vec();
         })
         .build_with_auto_env(&server)
         .await?;

@@ -8,6 +8,7 @@ pub use codex_file_system::WalkOutcome;
 use codex_file_system::WireFileSystemSandboxContext;
 use codex_install_context::InstallContext;
 use codex_network_proxy::ManagedNetworkSandboxContext;
+use codex_network_proxy::RemoteCredentialMasking;
 use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -41,6 +42,8 @@ pub const FS_CLOSE_METHOD: &str = "fs/close";
 pub const FS_WRITE_FILE_METHOD: &str = "fs/writeFile";
 pub const FS_CREATE_DIRECTORY_METHOD: &str = "fs/createDirectory";
 pub const FS_GET_METADATA_METHOD: &str = "fs/getMetadata";
+pub const FS_WATCH_MISSING_METHOD: &str = "fs/watchMissing";
+pub const FS_MISSING_CHANGED_METHOD: &str = "fs/missingChanged";
 pub const FS_CANONICALIZE_METHOD: &str = "fs/canonicalize";
 pub const FS_READ_DIRECTORY_METHOD: &str = "fs/readDirectory";
 pub const FS_WALK_METHOD: &str = "fs/walk";
@@ -151,13 +154,22 @@ fn unknown_executor_version() -> String {
 pub struct EnvironmentCapabilities {
     /// Whether `exec` accepts instructions for launching an executor-local network proxy.
     #[serde(default)]
-    pub network_proxy_launch: bool,
+    network_proxy_launch: bool,
+    /// Whether executor proxies enforce managed review domains before ordinary allows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_proxy_review_domains: bool,
     /// Whether the selected shell can mask executor environment credentials.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub credential_masking: bool,
+    credential_masking: bool,
+    /// Whether credential masking also supports configured providers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    credential_masking_custom_providers: bool,
     /// Whether capability discovery applies the filesystem sandbox sent with each root.
     #[serde(default)]
     pub capability_discovery_sandbox: bool,
+    /// Whether missing metadata paths can be watched on this physical connection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fs_watch_missing: bool,
     /// Whether this executor supports V2 capability discovery.
     #[serde(default)]
     pub capability_discovery_v2: bool,
@@ -185,6 +197,31 @@ pub struct EnvironmentCapabilities {
     /// Whether approved Linux root writes preserve devices and denied root-metadata symlink targets.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub linux_approved_root_write_preserves_restrictions: bool,
+}
+
+impl EnvironmentCapabilities {
+    /// Network proxy features available through this executor.
+    pub fn network_proxy(&self) -> NetworkProxyCapabilities {
+        NetworkProxyCapabilities {
+            launch: self.network_proxy_launch,
+            credential_masking: if !self.credential_masking {
+                RemoteCredentialMasking::Disabled
+            } else if self.credential_masking_custom_providers {
+                RemoteCredentialMasking::WithConfiguredProviders
+            } else {
+                RemoteCredentialMasking::BuiltInOnly
+            },
+        }
+    }
+}
+
+/// Features supported by an executor-local network proxy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkProxyCapabilities {
+    /// Whether `exec` accepts instructions for launching an executor-local network proxy.
+    pub launch: bool,
+    /// Credential masking support available through the selected shell.
+    pub credential_masking: RemoteCredentialMasking,
 }
 
 /// Status returned by an initialized exec-server connection.
@@ -285,8 +322,11 @@ impl EnvironmentInfo {
             temp_dir,
             capabilities: EnvironmentCapabilities {
                 network_proxy_launch: true,
+                network_proxy_review_domains: true,
                 credential_masking,
+                credential_masking_custom_providers: credential_masking,
                 capability_discovery_sandbox: true,
+                fs_watch_missing: cfg!(target_os = "linux"),
                 capability_discovery_v2: true,
                 environment_config_read: true,
                 http_header_env_vars: true,
@@ -455,6 +495,24 @@ pub struct ShellSnapshotRequest {
     pub scope_id: String,
     /// Executor-native shell used to capture and restore the snapshot.
     pub shell: ShellInfo,
+}
+
+/// Optional JSON-RPC error data for a rejected `process/start`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ProcessStartErrorData {
+    SpawnNotFound,
+    SpawnPermissionDenied,
+    SpawnFailed,
+    SandboxUnavailable,
+    SandboxPreparation,
+}
+
+impl ProcessStartErrorData {
+    pub fn attach_to(self, mut error: JSONRPCErrorError) -> JSONRPCErrorError {
+        error.data = Some(serde_json::json!(self));
+        error
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,6 +778,27 @@ pub struct FsGetMetadataParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+/// One unsandboxed metadata observation per connection. A newer id supersedes the prior watch.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsWatchMissingParams {
+    pub watch_id: u64,
+    pub missing: Vec<PathUri>,
+    pub present: Option<PathUri>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsWatchMissingResponse {
+    pub watching: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsMissingChangedNotification {
+    pub watch_id: u64,
 }
 
 /// Filesystem RPC wire request with legacy optional sandbox policy cwd.
@@ -1240,6 +1319,7 @@ mod tests {
     fn discovery_v2_support_defaults_off_for_older_executors() -> serde_json::Result<()> {
         let legacy: super::EnvironmentCapabilities = serde_json::from_value(serde_json::json!({}))?;
         assert!(!legacy.capability_discovery_v2);
+        assert!(!legacy.fs_watch_missing);
         let capabilities = super::EnvironmentInfo::local().capabilities;
         assert_eq!(
             serde_json::from_value::<super::EnvironmentCapabilities>(serde_json::to_value(
@@ -1260,6 +1340,7 @@ mod tests {
     use super::FsOpenParams;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
+    use super::NetworkProxyCapabilities;
     use super::ProcessId;
     use super::ProcessSandboxType;
     use super::ShellInfo;
@@ -1270,6 +1351,7 @@ mod tests {
     use codex_network_proxy::ManagedNetworkSandboxContext;
     use codex_network_proxy::NetworkProxyAuditMetadata;
     use codex_network_proxy::NetworkProxyConfig;
+    use codex_network_proxy::RemoteCredentialMasking;
     use codex_network_proxy::RemoteNetworkProxyConfig;
     use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
     use codex_protocol::config_types::WindowsSandboxProxySettingsMode;
@@ -1507,8 +1589,11 @@ mod tests {
             capabilities,
             EnvironmentCapabilities {
                 network_proxy_launch: true,
+                network_proxy_review_domains: false,
                 credential_masking: false,
+                credential_masking_custom_providers: false,
                 capability_discovery_sandbox: true,
+                fs_watch_missing: false,
                 capability_discovery_v2: false,
                 environment_config_read: false,
                 http_header_env_vars: false,
@@ -1520,6 +1605,88 @@ mod tests {
                 linux_approved_root_write_preserves_restrictions: false,
             }
         );
+
+        for (input_masking, expected_masking, output_masking) in [
+            (
+                serde_json::json!({}),
+                RemoteCredentialMasking::Disabled,
+                serde_json::json!({}),
+            ),
+            (
+                serde_json::json!({ "credentialMasking": true }),
+                RemoteCredentialMasking::BuiltInOnly,
+                serde_json::json!({ "credentialMasking": true }),
+            ),
+            (
+                serde_json::json!({
+                    "credentialMasking": true,
+                    "credentialMaskingCustomProviders": false,
+                }),
+                RemoteCredentialMasking::BuiltInOnly,
+                serde_json::json!({ "credentialMasking": true }),
+            ),
+            (
+                serde_json::json!({
+                    "credentialMasking": true,
+                    "credentialMaskingCustomProviders": true,
+                }),
+                RemoteCredentialMasking::WithConfiguredProviders,
+                serde_json::json!({
+                    "credentialMasking": true,
+                    "credentialMaskingCustomProviders": true,
+                }),
+            ),
+            (
+                serde_json::json!({ "credentialMaskingCustomProviders": true }),
+                RemoteCredentialMasking::Disabled,
+                serde_json::json!({ "credentialMaskingCustomProviders": true }),
+            ),
+            (
+                serde_json::json!({
+                    "credentialMasking": false,
+                    "credentialMaskingCustomProviders": true,
+                }),
+                RemoteCredentialMasking::Disabled,
+                serde_json::json!({ "credentialMaskingCustomProviders": true }),
+            ),
+        ] {
+            for launch in [None, Some(false), Some(true)] {
+                let mut input = serde_json::json!({
+                    "capabilityDiscoverySandbox": true,
+                });
+                if let Some(launch) = launch {
+                    input["networkProxyLaunch"] = launch.into();
+                }
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(input_masking.as_object().unwrap().clone());
+                let decoded: EnvironmentCapabilities = serde_json::from_value(input).unwrap();
+                assert_eq!(
+                    decoded.network_proxy(),
+                    NetworkProxyCapabilities {
+                        launch: launch.unwrap_or_default(),
+                        credential_masking: expected_masking,
+                    }
+                );
+                let mut expected_wire = serde_json::json!({
+                    "networkProxyLaunch": launch.unwrap_or_default(),
+                    "capabilityDiscoverySandbox": true,
+                    "capabilityDiscoveryV2": false,
+                    "environmentConfigRead": false,
+                    "httpHeaderEnvVars": false,
+                    "sandboxedFileStreaming": false,
+                    "fileWriteStreaming": false,
+                    "shellSnapshotV2": false,
+                    "windowsMxc": false,
+                });
+                expected_wire
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(output_masking.as_object().unwrap().clone());
+                assert_eq!(serde_json::to_value(decoded).unwrap(), expected_wire);
+            }
+        }
     }
 
     #[test]
