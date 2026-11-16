@@ -8,38 +8,17 @@ use crate::bottom_pane::paste_burst::PasteBurst;
 use crate::bottom_pane::textarea::TextArea;
 use crate::bottom_pane::textarea::TextAreaState;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum PromptPrefix {
-    #[default]
-    None,
-    Shell,
-    Slash,
-}
-
-impl PromptPrefix {
-    pub(super) fn text(self) -> &'static str {
-        match self {
-            Self::None => "",
-            Self::Shell => "!",
-            Self::Slash => "/",
-        }
-    }
-
-    pub(super) fn len(self) -> usize {
-        self.text().len()
-    }
-}
-
 pub(super) struct DraftState {
     pub(super) textarea: TextArea,
     pub(super) textarea_state: RefCell<TextAreaState>,
-    pub(super) prompt_prefix: PromptPrefix,
-    pub(super) slash_command_element_id: Option<u64>,
+    pub(super) is_bash_mode: bool,
     pub(super) pending_pastes: Vec<(String, String)>,
     pub(super) input_enabled: bool,
     pub(super) input_disabled_placeholder: Option<String>,
     pub(super) paste_burst: PasteBurst,
     pub(super) disable_paste_burst: bool,
+    /// Byte offset of the space added by the last skill completion, until the next key is resolved.
+    pub(super) skill_completion_space: Option<usize>,
     pub(super) mention_bindings: HashMap<u64, ComposerMentionBinding>,
     pub(super) recent_submission_mention_bindings: Vec<MentionBinding>,
 }
@@ -49,16 +28,27 @@ impl DraftState {
         Self {
             textarea: TextArea::new(),
             textarea_state: RefCell::new(TextAreaState::default()),
-            prompt_prefix: PromptPrefix::None,
-            slash_command_element_id: None,
+            is_bash_mode: false,
             pending_pastes: Vec::new(),
             input_enabled: true,
             input_disabled_placeholder: None,
             paste_burst: PasteBurst::default(),
             disable_paste_burst: false,
+            skill_completion_space: None,
             mention_bindings: HashMap::new(),
             recent_submission_mention_bindings: Vec::new(),
         }
+    }
+
+    pub(super) fn skill_completion_space_for_char(&self, ch: char) -> Option<usize> {
+        self.skill_completion_space.filter(|&space| {
+            ",.;:!?)]}。，、！？》".contains(ch)
+                && self.textarea.allows_paste_burst()
+                && !self.textarea.is_vim_replace_mode()
+                && self.textarea.cursor() == space + 1
+                && self.textarea.mouse_selection_range().is_none()
+                && self.textarea.text().get(space..space + 1) == Some(" ")
+        })
     }
 }
 

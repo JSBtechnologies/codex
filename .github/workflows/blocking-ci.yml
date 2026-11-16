@@ -38,6 +38,9 @@ jobs:
     secrets: inherit
 
   rust-ci:
+    permissions:
+      contents: read
+      id-token: write
     name: rust-ci
     uses: ./.github/workflows/rust-ci.yml
     secrets: inherit

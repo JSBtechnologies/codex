@@ -1,28 +1,41 @@
 //! One model response on an ephemeral fork that inherits the source's configuration and context.
 
+use super::ThreadSource;
 use crate::JsonSchema;
 use crate::RequestId;
 use crate::TS;
 use codex_protocol::openai_models::ReasoningEffort;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSampleParams {
     pub thread_id: String,
-    /// The loaded source's latest completed turn. Stale or active sources are rejected.
+    /// The loaded source's latest turn, which must be finished (completed, failed, or interrupted) unless `allowInProgressTurn` is true.
     pub expected_turn_id: String,
+    /// Allow sampling the latest turn before it finishes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_in_progress_turn: bool,
     pub prompt: String,
     /// Applied only when the provider and model support cache-preserving reasoning-effort updates.
     #[ts(optional = nullable)]
     pub effort: Option<ReasoningEffort>,
     #[ts(optional = nullable)]
+    pub thread_source: Option<ThreadSource>,
+    #[ts(optional = nullable)]
     pub turn_trigger: Option<String>,
+    /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
     /// Disable MCP servers when the inherited window uses incremental tools on Responses Lite.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disable_mcp: bool,
+    /// Override upstream interruption on cancellation for this sample; otherwise inherit the parent.
+    #[ts(optional = nullable)]
+    pub interrupt_on_cancel: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

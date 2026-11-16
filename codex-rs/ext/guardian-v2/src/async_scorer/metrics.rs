@@ -26,7 +26,6 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
         LunaSamplerError::MissingOutput => "missing_output",
         LunaSamplerError::OutputTooLarge => "output_too_large",
         LunaSamplerError::Superseded => "superseded",
-        LunaSamplerError::IncompatibleCompaction => "incompatible_compaction",
         LunaSamplerError::InputTooLarge => "input_too_large",
         LunaSamplerError::QueueFull => "queue_full",
         LunaSamplerError::Api(error) => match error {
@@ -47,17 +46,26 @@ pub(super) fn sampler_failure_reason(error: &LunaSamplerError) -> &'static str {
             ApiError::Transport(TransportError::ResponseTooLarge { .. }) => "response_too_large",
             ApiError::Transport(TransportError::Policy(_)) => "network_policy_denied",
             ApiError::Stream(_) | ApiError::ContentFilter => "stream_error",
+            ApiError::WebsocketMessageTooLarge => "websocket_message_too_large",
             ApiError::ResponseIncomplete(_) => "incomplete_response",
             ApiError::ContextWindowExceeded => "context_window_exceeded",
             ApiError::QuotaExceeded => "quota_exceeded",
             ApiError::UsageNotIncluded => "usage_not_included",
+            ApiError::SessionBudgetExceeded => "session_budget_exceeded",
             ApiError::Retryable { .. } => "retryable_api_error",
             ApiError::RateLimitExceeded { .. } | ApiError::RateLimit(_) => "rate_limit",
-            ApiError::InvalidRequest { .. } | ApiError::InvalidPrompt { .. } => "invalid_request",
+            ApiError::ModelNotFound { .. } => "model_not_found",
+            ApiError::InvalidRequest { .. }
+            | ApiError::InvalidAudioInput { .. }
+            | ApiError::InvalidPrompt { .. } => "invalid_request",
+            ApiError::AccessProgramNotEnabled { .. } => "access_program_not_enabled",
+            ApiError::ContentPolicyViolation { .. } => "content_policy_violation",
             ApiError::CyberPolicy { .. }
             | ApiError::BioPolicy { .. }
+            | ApiError::InferenceHookDenied { .. }
             | ApiError::MisalignmentPolicyViolation { .. } => "policy_error",
             ApiError::ServerOverloaded { .. } => "server_overloaded",
+            ApiError::PolicyCapacityUnavailable { .. } => "policy_capacity_unavailable",
             ApiError::FlexUnavailable => "flex_unavailable",
         },
     }
@@ -145,17 +153,10 @@ pub(super) fn record_section_costs(
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum RequestAdmission {
-    Admitted,
-    Rejected,
-}
-
 pub(super) fn record_request_tokens(
     metrics: Option<&dyn ExtensionMetrics>,
     existing: usize,
     total: usize,
-    admission: RequestAdmission,
 ) {
     let Some(metrics) = metrics else {
         return;
@@ -167,7 +168,7 @@ pub(super) fn record_request_tokens(
     ] {
         let mut tags = vec![("target", "async"), ("component", component)];
         // Histogram Count grouped by token_bucket counts only admitted complete inputs.
-        if component == "total" && matches!(admission, RequestAdmission::Admitted) {
+        if component == "total" {
             tags.push((
                 "token_bucket",
                 codex_guardian_context::request_token_bucket(total),

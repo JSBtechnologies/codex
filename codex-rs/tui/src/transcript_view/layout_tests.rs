@@ -46,7 +46,9 @@ fn layouts_refresh_for_width_animation_and_mutable_frames() {
                 &history,
                 width,
                 CellPresentation {
+                    summarized: false,
                     separated: false,
+                    shares_prompt_background: false,
                     turn_tip_space: false,
                     expanded: false,
                     disclosure: false,
@@ -103,7 +105,9 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
             &history,
             /*width*/ 20,
             CellPresentation {
+                summarized: false,
                 separated: false,
+                shares_prompt_background: false,
                 turn_tip_space: false,
                 expanded: false,
                 disclosure: false,
@@ -124,7 +128,9 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
             &history,
             /*width*/ 20,
             CellPresentation {
+                summarized: false,
                 separated: false,
+                shares_prompt_background: false,
                 turn_tip_space: false,
                 expanded: false,
                 disclosure: false,

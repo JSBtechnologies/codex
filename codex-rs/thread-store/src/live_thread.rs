@@ -138,7 +138,16 @@ impl LiveThread {
     ) -> ThreadStoreResult<Self> {
         let thread_id = params.thread_id;
         let history_mode = params.history_mode;
-        let metadata_sync = ThreadMetadataSync::for_create(&params).await;
+        let inherited_preview = if params.forked_from_id.is_some() {
+            thread_store
+                .read_pending_thread_metadata(thread_id)
+                .await?
+                .and_then(|patch| patch.preview)
+        } else {
+            None
+        };
+        let metadata_sync =
+            ThreadMetadataSync::for_create(&params, inherited_preview.as_deref()).await;
         thread_store.create_thread(params).await?;
         Ok(Self {
             thread_id,
@@ -409,6 +418,18 @@ impl LiveThread {
             .live_rollout_path(self.thread_id)
             .await
             .map(Some)
+    }
+
+    /// Selects a local feedback input only after its writer has materialized it.
+    pub async fn feedback_rollout_path(&self) -> ThreadStoreResult<Option<PathBuf>> {
+        let Some(local_store) = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+        else {
+            return Ok(None);
+        };
+        local_store.feedback_rollout_path(self.thread_id).await
     }
 
     async fn flush_pending_metadata_update(&self) -> ThreadStoreResult<()> {

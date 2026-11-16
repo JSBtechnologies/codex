@@ -18,13 +18,6 @@ fn plain_text_composer_keeps_command_prefixes_literal() {
     ] {
         composer.handle_key_event(KeyEvent::new(KeyCode::Char(prefix), modifiers));
         composer.handle_paste("keep this literal".into());
-        if prefix == '/' {
-            let area = Rect::new(0, 0, /*width*/ 40, /*height*/ 4);
-            let mut buffer = Buffer::empty(area);
-            composer.render(area, &mut buffer);
-            assert_eq!(buffer[(0, 1)].symbol(), "›");
-            assert_eq!(buffer[(2, 1)].symbol(), "/");
-        }
         assert_eq!(
             composer.handle_key_event(KeyCode::Tab.into()).0,
             InputResult::Submitted {
@@ -62,7 +55,7 @@ fn embedded_composer_shows_validation_error_without_losing_draft() {
     let (mut composer, mut rx) = new_test_composer();
     composer.config = ChatComposerConfig::plain_text();
     composer.set_footer_hint_override(Some(vec![("enter".into(), "submit".into())]));
-    composer.set_context_window_pending(/*pending*/ true);
+    composer.set_context_window_hidden(/*hidden*/ true);
     let text = "x".repeat(MAX_USER_INPUT_TEXT_CHARS + 1);
     composer.handle_paste(text.clone());
     assert_eq!(

@@ -111,11 +111,13 @@ enum OrderedMcpOverlay {
 
 #[derive(Clone)]
 pub struct McpManager {
+    connection_pool: codex_mcp::McpConnectionPool,
     plugins_manager: Arc<PluginsManager>,
     extensions: Arc<ExtensionRegistry<Config>>,
     codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
     tool_catalog_cache: McpToolCatalogCache,
     shared_definitions: Arc<SharedMcpDefinitions>,
+    ema_state: Arc<codex_mcp::EmaState>,
 }
 
 impl McpManager {
@@ -134,12 +136,50 @@ impl McpManager {
         codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
     ) -> Self {
         Self {
+            connection_pool: codex_mcp::McpConnectionPool::default(),
             plugins_manager,
             extensions,
             codex_apps_tools_cache,
             tool_catalog_cache: McpToolCatalogCache::default(),
             shared_definitions: Arc::new(SharedMcpDefinitions::default()),
+            ema_state: Arc::default(),
         }
+    }
+
+    pub(crate) fn for_plugins_manager(&self, plugins_manager: Arc<PluginsManager>) -> Self {
+        let mut manager = Self::new_with_extensions(
+            plugins_manager,
+            Arc::clone(&self.extensions),
+            ConnectorRuntimeManager::default(),
+        );
+        manager.connection_pool = self.connection_pool.clone();
+        manager
+    }
+
+    pub fn plugins_manager(&self) -> Arc<PluginsManager> {
+        Arc::clone(&self.plugins_manager)
+    }
+
+    pub fn auth_manager(&self) -> Arc<codex_login::AuthManager> {
+        self.plugins_manager.auth_manager()
+    }
+
+    pub fn runtime_auth_for_config(
+        &self,
+        config: &Config,
+    ) -> Option<(
+        codex_runtime_agent_instance::RuntimeAuthSlot,
+        codex_features::RuntimeAuthMode,
+    )> {
+        config
+            .features
+            .enabled(Feature::RuntimeAgentInstances)
+            .then(|| {
+                (
+                    self.plugins_manager.runtime_auth_slot(),
+                    config.runtime_auth_mode,
+                )
+            })
     }
 
     pub fn codex_apps_tools_cache(&self) -> ConnectorRuntimeManager<ToolInfo> {
@@ -150,21 +190,27 @@ impl McpManager {
         self.tool_catalog_cache.clone()
     }
 
+    pub(crate) fn connection_pool(&self) -> codex_mcp::McpConnectionPool {
+        self.connection_pool.clone()
+    }
+
     pub(crate) fn shared_definitions(&self) -> &SharedMcpDefinitions {
         &self.shared_definitions
     }
 
     /// Returns the MCP config after applying compatibility built-ins and
-    /// runtime-only extension overlays.
-    pub async fn runtime_config(&self, config: &Config) -> McpConfig {
+    /// runtime-only extension overlays and restrictions from the supplied contribution context.
+    pub async fn runtime_config(
+        &self,
+        context: McpServerContributionContext<'_, Config>,
+    ) -> McpConfig {
         self.runtime_config_with_context(
-            McpServerContributionContext::global(config),
-            // Threadless discovery and control-plane paths have no effective thread
-            // originator; active-thread tool calls use runtime_config_for_step below.
-            /*originator*/
-            None,
-            McpEnvironmentScope::HostOnly,
-            &[],
+            context,
+            context.originator(),
+            context
+                .selected_environments()
+                .map_or(McpEnvironmentScope::HostOnly, McpEnvironmentScope::Selected),
+            context.disabled_plugin_ids(),
         )
         .await
         .config
@@ -206,24 +252,19 @@ impl McpManager {
     }
 
     /// Resolves only plugins from this step's ready roots, independent of shared MCP refresh.
-    pub(crate) async fn selected_plugins_for_step(
+    pub(crate) async fn selected_plugins_for_step<'a>(
         &self,
-        context: McpServerContributionContext<'_, Config>,
+        context: McpServerContributionContext<'a, Config>,
         plugins_config: &PluginsConfigToml,
-        disabled_plugin_ids: &[String],
+        disabled_plugin_ids: &'a [String],
     ) -> SelectedPluginSnapshot {
-        let roots = context
-            .ready_selected_capability_roots()
-            .unwrap_or_default();
+        let context = context.with_disabled_plugin_ids(disabled_plugin_ids);
         let mut selected = SelectedPluginSnapshot {
             disabled_plugin_ids: disabled_plugin_ids.to_vec(),
             ..Default::default()
         };
-        let v2 = context.executor_capability_discovery_v2().is_some();
         let available_roots = available_plugin_roots(context);
-        if roots.is_empty() && !v2 {
-            return selected;
-        }
+        // Check hosted plugins even when no executor roots are selected.
         for contributor in self.extensions.mcp_server_contributors() {
             for SelectedPlugin {
                 selected_root_id,
@@ -457,6 +498,7 @@ impl McpManager {
             !selected_plugins.is_empty() || !loaded_plugins.capability_summaries().is_empty();
         let mut mcp_config = config
             .to_mcp_config_with_loaded_plugins(&loaded_plugins, selected_plugin_registrations);
+        mcp_config.ema_state = Arc::clone(&self.ema_state);
         let mut catalog = mcp_config.mcp_server_catalog.to_builder();
         // Isolated sessions do not inherit the implicit Apps connection.
         if mcp_config.apps_enabled
@@ -497,7 +539,8 @@ impl McpManager {
         });
         for conflict in catalog.conflicts() {
             tracing::warn!(
-                server = conflict.name,
+                server = conflict.server_key.name(),
+                environment_id = conflict.server_key.scoped_environment_id(),
                 outcome = ?conflict.outcome,
                 contenders = ?conflict.contenders,
                 "conflicting MCP server actions; using resolved catalog outcome"
@@ -524,7 +567,9 @@ impl McpManager {
 
     /// Returns configured and host-contributed servers before auth gating.
     pub async fn runtime_servers(&self, config: &Config) -> HashMap<String, McpServerConfig> {
-        let mcp_config = self.runtime_config(config).await;
+        let mcp_config = self
+            .runtime_config(McpServerContributionContext::global(config))
+            .await;
         configured_mcp_servers(&mcp_config)
     }
 
@@ -533,8 +578,10 @@ impl McpManager {
         &self,
         config: &Config,
         auth: Option<&CodexAuth>,
-    ) -> HashMap<String, EffectiveMcpServer> {
-        let mcp_config = self.runtime_config(config).await;
+    ) -> HashMap<codex_mcp::McpServerKey, EffectiveMcpServer> {
+        let mcp_config = self
+            .runtime_config(McpServerContributionContext::global(config))
+            .await;
         effective_mcp_servers(&mcp_config, auth)
     }
 }

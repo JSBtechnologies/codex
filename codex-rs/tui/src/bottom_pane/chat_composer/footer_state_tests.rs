@@ -18,7 +18,7 @@ fn composer() -> ChatComposer {
         /*disable_paste_burst*/ true,
     );
     composer.set_status_line_enabled(/*enabled*/ true);
-    composer.set_status_line(Some(Line::from("MODEL STATUS")));
+    composer.set_status_line(Some(Line::from("MODEL STATUS").into()));
     composer
 }
 
@@ -28,6 +28,7 @@ fn render(
 ) -> (Buffer, Option<(u16, u16)>) {
     let options = composer.resolve_render_options(ComposerRenderOptions {
         footer,
+        separate_status_line: true,
         ..ComposerRenderOptions::default()
     });
     let width = 60;
@@ -60,7 +61,8 @@ fn text(buffer: &Buffer) -> String {
 #[test]
 fn retained_command_suggestions_yield_paint_and_cursor_to_find() {
     let mut composer = composer();
-    composer.insert_str("/");
+    composer.draft.textarea.insert_str("/");
+    composer.sync_popups();
     let original = render(&composer, /*footer*/ None);
     let footer = TranscriptFooter {
         text: vec![
@@ -74,6 +76,7 @@ fn retained_command_suggestions_yield_paint_and_cursor_to_find() {
     let options = composer.resolve_render_options(ComposerRenderOptions {
         footer: Some(&footer),
         command_popup_placement: CommandPopupPlacement::Hidden,
+        separate_status_line: true,
         ..ComposerRenderOptions::default()
     });
     let mut frames = Vec::new();
@@ -90,8 +93,7 @@ fn retained_command_suggestions_yield_paint_and_cursor_to_find() {
                 .then_some((footer_area.x + 8, footer_area.y))
         );
         assert!(matches!(composer.popups.active, ActivePopup::Command(_)));
-        assert_eq!(composer.current_text(), "/");
-        assert!(composer.draft.textarea.is_empty());
+        assert_eq!(composer.draft.textarea.text(), "/");
         frames.push(format!(
             "{width}x{height}, cursor {cursor:?}\n{}",
             text(&buffer)
@@ -122,7 +124,10 @@ fn copying_from_find_preserves_the_query_above_selection_feedback() {
     );
     let (buffer, cursor) = render(&composer, Some(&footer));
     assert_eq!(cursor, None);
-    insta::assert_snapshot!("transcript_find_copy_footer", text(&buffer));
+    let output = text(&buffer);
+    assert!(output.contains("Find: needle"));
+    assert!(output.contains("Copied selection to clipboard"));
+    insta::assert_snapshot!("transcript_find_copy_footer", output);
 }
 
 #[test]

@@ -110,7 +110,11 @@ async fn control_input_acknowledges_bearer_renewal_with_or_without_metadata() ->
             true,
         ),
     ] {
-        let (metadata, mut tokens) = control_input(Cursor::new(input), includes_metadata)?;
+        let (metadata, mut tokens) = control_input(
+            Cursor::new(input),
+            includes_metadata,
+            /*require_portals_oauth*/ false,
+        )?;
         let metadata = metadata.await??;
         if includes_metadata {
             assert_eq!(metadata["x-test-route"], "private-value");
@@ -134,8 +138,38 @@ async fn control_input_acknowledges_bearer_renewal_with_or_without_metadata() ->
 }
 
 #[tokio::test]
+async fn portals_listener_requires_oauth_metadata() -> Result<()> {
+    let (headers, mut tokens) = control_input(
+        Cursor::new(b"opaque-access-token\n"),
+        /*connect_headers_stdin*/ false,
+        /*require_portals_oauth*/ true,
+    )?;
+    assert_eq!(
+        headers.await?.unwrap_err().to_string(),
+        "Portals requires OAuth CONNECT metadata"
+    );
+    assert!(tokens.recv().await.is_none());
+
+    let (headers, mut tokens) = control_input(
+        Cursor::new(b"[[\"x-portals-auth-mode\",\"oauth\"]]\nopaque-access-token\n"),
+        /*connect_headers_stdin*/ true,
+        /*require_portals_oauth*/ true,
+    )?;
+    assert_eq!(headers.await??["x-portals-auth-mode"], "oauth");
+    assert_eq!(
+        tokens.recv().await.unwrap()?.unwrap(),
+        "Bearer opaque-access-token"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn closed_parent_pipe_finishes_even_before_proxy_readiness() -> Result<()> {
-    let (_, mut tokens) = control_input(Cursor::new([]), /*connect_headers_stdin*/ false)?;
+    let (_, mut tokens) = control_input(
+        Cursor::new([]),
+        /*connect_headers_stdin*/ false,
+        /*require_portals_oauth*/ false,
+    )?;
     let (updates, _) = watch::channel("Bearer initial".parse()?);
     let (_ready, readiness) = oneshot::channel();
     let mut output = Vec::new();
@@ -185,8 +219,11 @@ async fn invalid_control_input_stops_credentials_without_exposing_secrets() -> R
     for &(case, input) in invalid_metadata {
         let mut input = input.to_vec();
         input.extend_from_slice(b"private-secret\n");
-        let (metadata, mut tokens) =
-            control_input(Cursor::new(input), /*connect_headers_stdin*/ true)?;
+        let (metadata, mut tokens) = control_input(
+            Cursor::new(input),
+            /*connect_headers_stdin*/ true,
+            /*require_portals_oauth*/ false,
+        )?;
         let error = metadata.await?.expect_err(case);
         assert!(!format!("{error:#}").contains("private-"), "{case}");
         assert!(tokens.recv().await.is_none(), "{case}");
@@ -196,8 +233,11 @@ async fn invalid_control_input_stops_credentials_without_exposing_secrets() -> R
         ("empty bearer", b"\n".to_vec()),
         ("bearer limit", vec![b'x'; MAX_TOKEN_BYTES + 1]),
     ] {
-        let (metadata, mut tokens) =
-            control_input(Cursor::new(input), /*connect_headers_stdin*/ false)?;
+        let (metadata, mut tokens) = control_input(
+            Cursor::new(input),
+            /*connect_headers_stdin*/ false,
+            /*require_portals_oauth*/ false,
+        )?;
         assert!(metadata.await??.is_empty(), "{case}");
         let error = tokens.recv().await.expect(case).expect_err(case);
         assert!(!format!("{error:#}").contains("private-"), "{case}");
@@ -206,8 +246,7 @@ async fn invalid_control_input_stops_credentials_without_exposing_secrets() -> R
     Ok(())
 }
 
-#[tokio::test]
-async fn transport_reconnect_keeps_listener_and_does_not_replay_old_tcp_streams() -> Result<()> {
+fn local_proxy() -> Result<(quinn::Endpoint, quinn::ClientConfig)> {
     let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(vec!["127.0.0.1".to_string()])?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -223,7 +262,6 @@ async fn transport_reconnect_keeps_listener_and_does_not_replay_old_tcp_streams(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_tls)?,
     ));
     let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse()?)?;
-    let proxy_address = endpoint.local_addr()?;
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.der().clone())?;
@@ -235,6 +273,166 @@ async fn transport_reconnect_keeps_listener_and_does_not_replay_old_tcp_streams(
     let config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)?,
     ));
+
+    Ok((endpoint, config))
+}
+
+#[tokio::test]
+async fn stdio_propagates_half_close_and_exits_on_gateway_eof_or_rejection() -> Result<()> {
+    let (endpoint, config) = local_proxy()?;
+    let address = endpoint.local_addr()?;
+    let target = ProxyTarget {
+        host: address.ip().to_string(),
+        port: address.port(),
+        authority: address.to_string(),
+    };
+    let (done, keep_alive) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let quic = endpoint.accept().await.unwrap().await?;
+        let mut http = h3::server::Connection::new(h3_quinn::Connection::new(quic)).await?;
+        for (index, status) in [200, 200, 401].into_iter().enumerate() {
+            let (_, mut stream) = http.accept().await?.unwrap().resolve_request().await?;
+            stream
+                .send_response(Response::builder().status(status).body(())?)
+                .await?;
+            if status == 200 {
+                stream.send_data(Bytes::from_static(b"\0\xff")).await?;
+            }
+            // First request must forward the final bytes and FIN before reading the reply.
+            // The next request sees remote EOF with its own input still open.
+            if index == 0 {
+                let mut data = stream.recv_data().await?.unwrap();
+                let size = data.remaining();
+                assert_eq!(data.copy_to_bytes(size), Bytes::from_static(b"request"));
+                assert!(stream.recv_data().await?.is_none());
+                stream.send_data(Bytes::from_static(b"after FIN")).await?;
+            }
+            stream.finish().await?;
+        }
+        let _ = keep_alive.await;
+        anyhow::Ok(())
+    });
+    let ProxyConnection {
+        endpoint: _endpoint,
+        quic: _quic,
+        mut connection,
+        mut sender,
+    } = ProxyConnection::connect(&target, &config).await?;
+    let driver = tokio::spawn(async move { connection.wait_idle().await });
+    for index in 0..3 {
+        let request = target.request(http::HeaderMap::new(), "Bearer fixture".parse()?)?;
+        let (mut input, reader) = tokio::io::duplex(16);
+        if index == 0 {
+            input.write_all(b"request").await?;
+            input.shutdown().await?;
+        }
+        let mut output = Vec::new();
+        let result = timeout(
+            Duration::from_secs(3),
+            super::bridge(
+                reader,
+                &mut output,
+                &mut sender,
+                request,
+                super::BridgeMode::ProxyCommand,
+            ),
+        )
+        .await?;
+        match index {
+            0 => {
+                result?;
+                assert_eq!(output, b"\0\xffafter FIN");
+            }
+            1 => {
+                result?;
+                assert_eq!(output, b"\0\xff");
+            }
+            _ => {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "MASQUE CONNECT rejected with status 401"
+                );
+                assert!(output.is_empty());
+            }
+        }
+    }
+    done.send(()).unwrap();
+    server.await??;
+    driver.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn connect_rejects_qpack_expansion_and_keeps_connection_usable() -> Result<()> {
+    timeout(Duration::from_secs(15), async {
+        let (endpoint, config) = local_proxy()?;
+        let address = endpoint.local_addr()?;
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let quic = endpoint.accept().await.unwrap().await.unwrap();
+            let mut control = quic.open_uni().await.unwrap();
+            // HTTP/3 control stream with empty SETTINGS.
+            control.write_all(&[0x00, 0x04, 0x00]).await.unwrap();
+            for fields in [648_u32, 649, 32_768, 1] {
+                let (mut send, _recv) = quic.accept_bi().await.unwrap();
+                // Bypass the server library's enforcement of peer SETTINGS.
+                // HEADERS with a four-byte QUIC varint length, QPACK prefix,
+                // :status=200, then one-byte static references to a 101-byte field.
+                let mut response = vec![0x01];
+                response.extend_from_slice(&(0x8000_0000 | (fields + 3)).to_be_bytes());
+                response.extend_from_slice(&[0x00, 0x00, 0xd9]);
+                response.resize(response.len() + fields as usize, 0xfa);
+                send.write_all(&response).await.unwrap();
+                send.finish().unwrap();
+            }
+            let _ = done_rx.await;
+        });
+        let target = ProxyTarget {
+            host: address.ip().to_string(),
+            port: address.port(),
+            authority: "127.0.0.1:22".to_string(),
+        };
+        let ProxyConnection {
+            endpoint: _endpoint,
+            quic: _quic,
+            mut connection,
+            mut sender,
+        } = ProxyConnection::connect(&target, &config).await?;
+        let driver = tokio::spawn(async move { connection.wait_idle().await });
+        for oversized in [false, true, true, false] {
+            let request = http::Request::builder()
+                .method(http::Method::CONNECT)
+                .uri(http::Uri::builder().authority("127.0.0.1:22").build()?)
+                .body(())?;
+            let mut stream = sender.send_request(request).await?;
+            let result = stream.recv_response().await;
+            if oversized {
+                let error = result.expect_err("oversized response must be rejected");
+                assert!(matches!(
+                    error,
+                    h3::error::StreamError::HeaderTooBig {
+                        actual_size,
+                        max_size: 65_536,
+                        ..
+                    } if actual_size > 65_536
+                ));
+            } else {
+                assert_eq!(result?.status(), http::StatusCode::OK);
+            }
+        }
+        done_tx.send(()).unwrap();
+        server.await?;
+        driver.abort();
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn transport_reconnect_keeps_listener_and_does_not_replay_old_tcp_streams() -> Result<()> {
+    let (endpoint, config) = local_proxy()?;
+    let proxy_address = endpoint.local_addr()?;
 
     let request_count = Arc::new(AtomicUsize::new(0));
     let server_request_count = request_count.clone();

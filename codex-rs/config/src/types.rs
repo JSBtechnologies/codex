@@ -21,6 +21,7 @@ pub use codex_protocol::config_types::AltScreenMode;
 pub use codex_protocol::config_types::ApprovalsReviewer;
 pub use codex_protocol::config_types::ModeKind;
 pub use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 pub use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ToolExposureSurface;
 pub use codex_protocol::config_types::WebSearchMode;
@@ -28,7 +29,9 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU64;
 
+use codex_utils_redacted_string::RedactedString;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -254,7 +257,7 @@ pub struct AnalyticsConfigToml {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct FeedbackConfigToml {
-    /// When `false`, disables the feedback flow across Codex product surfaces.
+    /// When `false`, disables feedback uploads and background Guardian review retention. Explicit local exports remain available.
     pub enabled: Option<bool>,
 }
 
@@ -320,7 +323,8 @@ pub use codex_protocol::MemoryVersion;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct MemoriesToml {
-    /// Selects the memory pipeline; v1 remains the default.
+    /// Selects the memory pipeline. Fresh profiles default to v2 when memories are enabled,
+    /// unless dual-write is explicitly disabled; existing v1 profiles default to v1.
     pub version: Option<MemoryVersion>,
     /// Generate both versions while v1 is selected; v2 runs alone after cutover.
     pub dual_write: Option<bool>,
@@ -352,6 +356,8 @@ pub struct MemoriesToml {
     pub extract_model: Option<String>,
     /// Model used for memory consolidation.
     pub consolidation_model: Option<String>,
+    /// Service tier for memory consolidation. Defaults to Standard (`"default"`).
+    pub consolidation_service_tier: Option<String>,
 }
 
 /// Effective memories settings after defaults are applied.
@@ -371,6 +377,7 @@ pub struct MemoriesConfig {
     pub min_rate_limit_remaining_percent: i64,
     pub extract_model: Option<String>,
     pub consolidation_model: Option<String>,
+    pub consolidation_service_tier: String,
 }
 
 impl Default for MemoriesConfig {
@@ -390,6 +397,7 @@ impl Default for MemoriesConfig {
             min_rate_limit_remaining_percent: DEFAULT_MEMORIES_MIN_RATE_LIMIT_REMAINING_PERCENT,
             extract_model: None,
             consolidation_model: None,
+            consolidation_service_tier: SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string(),
         }
     }
 }
@@ -438,6 +446,13 @@ impl From<MemoriesToml> for MemoriesConfig {
                 .clamp(0, 100),
             extract_model: toml.extract_model,
             consolidation_model: toml.consolidation_model,
+            consolidation_service_tier: toml
+                .consolidation_service_tier
+                .map(|tier| {
+                    ServiceTier::from_request_value(&tier)
+                        .map_or(tier, |tier| tier.request_value().to_string())
+                })
+                .unwrap_or(defaults.consolidation_service_tier),
         }
     }
 }
@@ -496,7 +511,7 @@ pub struct AppToolsConfig {
 }
 
 /// Approval settings for a connected account within an app.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AppLinkConfig {
     /// Reviewer for approval prompts from this account, overriding the app default.
@@ -509,7 +524,7 @@ pub struct AppLinkConfig {
 }
 
 /// Account settings for a single app.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AppLinksConfig {
     /// Per-account approval settings keyed by link ID.
@@ -518,7 +533,7 @@ pub struct AppLinksConfig {
 }
 
 /// Config values for a single app/connector.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AppConfig {
     /// When `false`, Codex does not surface this app.
@@ -603,7 +618,8 @@ pub enum OtelExporterKind {
     OtlpHttp {
         endpoint: String,
         #[serde(default)]
-        headers: HashMap<String, String>,
+        #[schemars(with = "HashMap<String, String>")]
+        headers: HashMap<String, RedactedString>,
         protocol: OtelHttpProtocol,
         #[serde(default)]
         tls: Option<OtelTlsConfig>,
@@ -611,7 +627,8 @@ pub enum OtelExporterKind {
     OtlpGrpc {
         endpoint: String,
         #[serde(default)]
-        headers: HashMap<String, String>,
+        #[schemars(with = "HashMap<String, String>")]
+        headers: HashMap<String, RedactedString>,
         #[serde(default)]
         tls: Option<OtelTlsConfig>,
     },
@@ -621,9 +638,16 @@ pub enum OtelExporterKind {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct OtelConfigToml {
+    /// Command that prints a JSON object of HTTP headers for explicit OTLP HTTP exporters.
+    /// Runs from CODEX_HOME. Repository-local configuration cannot set OTel options.
+    pub headers_helper: Option<String>,
+    /// Interval between helper executions in milliseconds. Defaults to 29 minutes.
+    pub headers_helper_refresh_interval_ms: Option<NonZeroU64>,
     /// Byte limit for tool-result log output; independent of model-visible output.
-    #[serde(default)]
-    pub tool_result: codex_protocol::config_types::ToolResultLogConfig,
+    pub tool_result: Option<codex_protocol::config_types::ToolResultLogConfig>,
+    /// Log successful SSE events whose kind ends in `.delta`. Defaults to true.
+    /// Disabling this preserves errors, completion events, and metrics.
+    pub log_sse_deltas: Option<bool>,
     /// Log user prompt in traces
     pub log_user_prompt: Option<bool>,
     /// Opt in to logging final main-agent and spawned-subagent responses to an OTLP log exporter.
@@ -647,7 +671,7 @@ pub struct OtelConfigToml {
     pub metrics_exporter: Option<OtelExporterKind>,
 
     /// Attributes to add to every exported trace span.
-    pub span_attributes: Option<BTreeMap<String, String>>,
+    pub span_attributes: Option<HashMap<String, String>>,
 
     /// Semicolon-separated `key:value` fields to upsert into W3C tracestate members.
     pub tracestate: Option<BTreeMap<String, BTreeMap<String, String>>>,
@@ -656,7 +680,10 @@ pub struct OtelConfigToml {
 /// Effective OTEL settings after defaults are applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OtelConfig {
+    pub headers_helper: Option<String>,
+    pub headers_helper_refresh_interval_ms: Option<NonZeroU64>,
     pub tool_result: codex_protocol::config_types::ToolResultLogConfig,
+    pub log_sse_deltas: bool,
     pub log_user_prompt: bool,
     pub log_agent_responses: bool,
     pub log_guardian_assessments: bool,
@@ -664,14 +691,17 @@ pub struct OtelConfig {
     pub exporter: OtelExporterKind,
     pub trace_exporter: OtelExporterKind,
     pub metrics_exporter: OtelExporterKind,
-    pub span_attributes: BTreeMap<String, String>,
+    pub span_attributes: HashMap<String, String>,
     pub tracestate: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for OtelConfig {
     fn default() -> Self {
         OtelConfig {
+            headers_helper: None,
+            headers_helper_refresh_interval_ms: None,
             tool_result: Default::default(),
+            log_sse_deltas: true,
             log_user_prompt: false,
             log_agent_responses: false,
             log_guardian_assessments: false,
@@ -679,7 +709,7 @@ impl Default for OtelConfig {
             exporter: OtelExporterKind::None,
             trace_exporter: OtelExporterKind::None,
             metrics_exporter: OtelExporterKind::Statsig,
-            span_attributes: BTreeMap::new(),
+            span_attributes: HashMap::new(),
             tracestate: BTreeMap::new(),
         }
     }
@@ -724,6 +754,7 @@ pub enum NotificationMethod {
     #[default]
     Auto,
     Osc9,
+    Osc777,
     Bel,
 }
 
@@ -732,6 +763,7 @@ impl fmt::Display for NotificationMethod {
         match self {
             NotificationMethod::Auto => write!(f, "auto"),
             NotificationMethod::Osc9 => write!(f, "osc9"),
+            NotificationMethod::Osc777 => write!(f, "osc777"),
             NotificationMethod::Bel => write!(f, "bel"),
         }
     }
@@ -848,10 +880,37 @@ impl QuickDial {
     }
 }
 
+/// The configured MCP server and advertised tool name identify a status line provider.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StatusLineProviderId {
+    pub server: String,
+    pub tool: String,
+}
+
+/// An explicit default overrides an MCP provider from a lower configuration layer.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum StatusLineSelection {
+    Builtin(BuiltinStatusLine),
+    Mcp(StatusLineProviderId),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BuiltinStatusLine {
+    Default,
+}
+
 /// Collection of settings that are specific to the TUI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct Tui {
+    /// Preferred hosts for new conversations, indexed by project and local user identity.
+    /// Read from the user configuration only; values are never endpoints or credentials.
+    #[serde(default)]
+    pub default_hosts: BTreeMap<String, BTreeMap<String, String>>,
+
     #[serde(default, flatten)]
     pub notification_settings: TuiNotificationSettings,
 
@@ -911,6 +970,15 @@ pub struct Tui {
     #[serde(default = "default_true")]
     pub fullscreen_transcript: bool,
 
+    /// Summarize tool calls and collapse completed turns in the full-screen transcript. Defaults to `false`.
+    #[serde(default)]
+    pub collapse_turn_details: bool,
+
+    /// Preferred docked sidebar width as a percentage of the terminal. Defaults to one third.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 99))]
+    pub sidebar_width_percent: Option<u8>,
+
     /// Mouse wheel speed multiplier for transcript scrolling, based on one row per event.
     /// Defaults to `1.0`. Positive fractional values slow scrolling; values above `1.0` speed it up.
     #[serde(default, deserialize_with = "crate::tui_mouse_scroll::deserialize")]
@@ -950,6 +1018,9 @@ pub struct Tui {
     /// When unset, the TUI defaults to: `model-with-reasoning`, `current-dir`, and `thread-name`.
     #[serde(default)]
     pub status_line: Option<Vec<String>>,
+
+    /// Local status line selection. Set to "default" for built-in items or specify an MCP server and tool.
+    pub status_line_provider: Option<Box<StatusLineSelection>>,
 
     /// Color status line items with colors derived from the active syntax theme.
     /// Defaults to `true`.
@@ -1139,6 +1210,11 @@ pub struct PluginConfig {
     /// Per-MCP-server policy overlays for MCP servers contributed by this plugin.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mcp_servers: HashMap<String, PluginMcpServerConfig>,
+
+    /// Connector-wide app settings keyed by connector ID. Ignored when this
+    /// plugin is disabled by configuration. Explicit top-level app fields win.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub apps: HashMap<String, AppConfig>,
 }
 
 /// Policy settings for a plugin-provided MCP server.
@@ -1202,6 +1278,9 @@ where
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct MarketplaceConfig {
+    /// Check for updates to installed Git plugins from this marketplace when plugins are listed.
+    #[serde(default)]
+    pub auto_update: bool,
     /// Last time Codex successfully added or refreshed this marketplace.
     #[serde(default)]
     pub last_updated: Option<String>,

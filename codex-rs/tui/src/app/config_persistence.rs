@@ -96,21 +96,42 @@ impl App {
     }
 
     pub(super) async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
+        self.rebuild_config_for_cwd_from(
+            &self.config,
+            &self.local_settings,
+            &self.app_server_target,
+            cwd,
+        )
+        .await
+    }
+
+    pub(super) fn rebuild_config_for_cwd_from(
+        &self,
+        base: &Config,
+        local: &crate::local_settings::LocalSettings,
+        target: &AppServerTarget,
+        cwd: PathBuf,
+    ) -> impl std::future::Future<Output = Result<Config>> + use<> {
         let mut overrides = self.harness_overrides.clone();
         overrides.cwd = Some(cwd.clone());
         let cwd_display = cwd.display().to_string();
+        // A remote app server's execution config can name a home on another machine.
+        let codex_home = if target.uses_remote_workspace() {
+            &local.codex_home
+        } else {
+            &base.codex_home
+        };
         let builder = ConfigBuilder::default()
-            .codex_home(self.config.codex_home.to_path_buf())
+            .codex_home(codex_home.to_path_buf())
             .cli_overrides(self.cli_kv_overrides.clone())
             .harness_overrides(overrides)
             .loader_overrides(self.loader_overrides.clone())
             .cloud_config_bundle(self.cloud_config_bundle.clone());
         build_config_on_runtime_worker(
             builder,
-            self.config.application_network_policy.clone(),
+            base.application_network_policy.clone(),
             format!("Failed to rebuild config for cwd {cwd_display}"),
         )
-        .await
     }
 
     #[cfg(test)]
@@ -487,6 +508,8 @@ impl App {
         self.chat_widget.local_settings.tui.session_picker_view =
             self.local_settings.tui.session_picker_view;
         self.chat_widget.local_settings.tui.resume_cwd = self.local_settings.tui.resume_cwd;
+        self.chat_widget.local_settings.tui.status_line_provider =
+            self.local_settings.tui.status_line_provider.clone();
         self.config = config;
         self.chat_widget.sync_plugin_mentions_config(&self.config);
         Ok(())
@@ -525,13 +548,18 @@ impl App {
     }
 
     pub(super) async fn rebuild_config_for_resume_or_fallback(
-        &mut self,
+        &self,
         current_cwd: &Path,
         resume_cwd: PathBuf,
+        fallback: (&Config, &crate::local_settings::LocalSettings),
+        target: &AppServerTarget,
     ) -> Result<(Config, crate::local_settings::LocalSettings)> {
-        match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
+        match self
+            .rebuild_config_for_cwd_from(fallback.0, fallback.1, target, resume_cwd.clone())
+            .await
+        {
             Ok(config) => {
-                let local_settings = self.local_settings.reloaded(&config);
+                let local_settings = fallback.1.reloaded(&config);
                 Ok((config, local_settings))
             }
             Err(err) => {
@@ -544,7 +572,7 @@ impl App {
                         cwd = %resume_cwd_display,
                         "failed to rebuild config for same-cwd resume; using current in-memory config"
                     );
-                    Ok((self.config.clone(), self.local_settings.clone()))
+                    Ok((fallback.0.clone(), fallback.1.clone()))
                 }
             }
         }
@@ -554,6 +582,19 @@ impl App {
         &mut self,
         config: &mut Config,
         scope: RuntimePolicyOverrideScope,
+    ) -> Result<()> {
+        self.apply_runtime_policy_overrides_with_reviewer(
+            config,
+            scope,
+            self.config.approvals_reviewer,
+        )
+    }
+
+    pub(super) fn apply_runtime_policy_overrides_with_reviewer(
+        &mut self,
+        config: &mut Config,
+        scope: RuntimePolicyOverrideScope,
+        restored_reviewer: ApprovalsReviewer,
     ) -> Result<()> {
         if let Some(policy) = self.runtime_approval_policy_override
             && (scope == RuntimePolicyOverrideScope::All
@@ -584,7 +625,7 @@ impl App {
                 .filter(|profile| {
                     profile.turn_override == RuntimePermissionProfileTurnOverride::Preserve
                 })
-                .map(|_| self.config.approvals_reviewer)
+                .map(|_| restored_reviewer)
         }) {
             config
                 .config_layer_stack
@@ -1137,10 +1178,12 @@ impl App {
         resume_model_settings_for_overrides(&self.config, &self.harness_overrides)
     }
 
-    pub(super) fn reject_remote_resume_permission_override(&mut self, config: &Config) -> bool {
-        if self.app_server_target.thread_params_mode()
-            != crate::app_server_session::ThreadParamsMode::Remote
-        {
+    pub(super) fn reject_remote_resume_permission_override(
+        &mut self,
+        config: &Config,
+        target: &AppServerTarget,
+    ) -> bool {
+        if target.thread_params_mode() != crate::app_server_session::ThreadParamsMode::Remote {
             return false;
         }
         let explicitly_selected =
@@ -1899,6 +1942,9 @@ enabled = false
 
         app.chat_widget
             .handle_thread_session(crate::session_state::ThreadSessionState {
+                read_only_history: false,
+                thread_settings_confirmed: true,
+                primary_environment_cwd: None,
                 daybreak_enabled: false,
                 windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
                 thread_id: ThreadId::new(),
@@ -1925,6 +1971,35 @@ enabled = false
         assert_eq!(app.chat_widget.config_ref().cwd.to_path_buf(), next_cwd);
         assert_eq!(app.config.cwd, original_cwd);
 
+        std::fs::write(app.config.codex_home.join("config.toml"), "")?;
+        crate::legacy_core::config::set_project_trust_level(
+            &app.config.codex_home,
+            &next_cwd,
+            codex_protocol::config_types::TrustLevel::Trusted,
+        )
+        .map_err(std::io::Error::other)?;
+        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        let target = SessionTarget {
+            backend_id: server.backend_id(),
+            thread_id: ThreadId::new(),
+            path: None,
+            cwd: None,
+            history_mode: None,
+        };
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let candidate = app
+            .resume_config_for_target(
+                &mut tui,
+                &mut server,
+                &target,
+                super::resume_preparation::ResumeSource::Active,
+            )
+            .await
+            .map_err(|_| color_eyre::eyre::eyre!("resume configuration should succeed"))?;
+        assert_eq!(candidate.0.cwd.to_path_buf(), next_cwd);
+        assert_eq!(app.config.cwd.to_path_buf(), next_cwd);
+        server.shutdown().await?;
+
         app.refresh_in_memory_config_from_disk().await?;
 
         assert_eq!(app.config.cwd, app.chat_widget.config_ref().cwd);
@@ -1939,6 +2014,10 @@ enabled = false
         expected_widget_settings.tui.session_picker_view =
             Some(codex_config::types::SessionPickerViewMode::Comfortable);
         expected_widget_settings.tui.resume_cwd = Some(codex_config::types::ResumeCwdMode::Current);
+        expected_widget_settings.tui.status_line_provider =
+            Some(Box::new(codex_config::types::StatusLineSelection::Builtin(
+                codex_config::types::BuiltinStatusLine::Default,
+            )));
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf().abs();
         std::fs::write(
@@ -1948,6 +2027,7 @@ enabled = false
 terminal_resize_reflow_max_rows = 9000
 session_picker_view = "comfortable"
 resume_cwd = "current"
+status_line_provider = "default"
 theme = "dracula"
 "#,
         )?;
@@ -2038,7 +2118,12 @@ theme = "dracula"
         let current_cwd = current_config.cwd.clone();
 
         let resume_config = app
-            .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.to_path_buf())
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                current_cwd.to_path_buf(),
+                (&app.config, &app.local_settings),
+                &app.app_server_target,
+            )
             .await?;
 
         assert_eq!(resume_config, (current_config, app.local_settings.clone()));
@@ -2056,7 +2141,12 @@ theme = "dracula"
         let next_cwd = next_cwd_tmp.path().to_path_buf();
 
         let result = app
-            .rebuild_config_for_resume_or_fallback(&current_cwd, next_cwd)
+            .rebuild_config_for_resume_or_fallback(
+                &current_cwd,
+                next_cwd,
+                (&app.config, &app.local_settings),
+                &app.app_server_target,
+            )
             .await;
 
         assert!(result.is_err());
